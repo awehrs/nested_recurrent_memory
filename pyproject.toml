@@ -1,0 +1,88 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nested-recurrent-memory"
+version = "0.1.0"
+description = "Nested hierarchical memory for linear attention"
+readme = "README.md"
+authors = [
+    { name = "Your Name", email = "you@example.com" },
+]
+license = { file = "LICENSE" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.7.0",
+    "triton>=3.0",
+    "flash-linear-attention",
+    "transformers>=4.45.0",
+    "einops",
+    "pytest>=9.1.1",
+    "ruff>=0.16.4",
+]
+
+[project.optional-dependencies]
+train = ["wandb", "pyyaml", "accelerate"]
+dev = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/yourname/nested-gdn"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nested_gdn*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 127
+
+[tool.autopep8]
+max-line-length = 127
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # Pyflakes
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "I",    # isort
+    "C4",   # flake8-comprehensions
+    "TCH",  # flake8-type-checking
+    "T",    # flake8-debugger
+]
+ignore = [
+    "E501", "E741",
+    "B023", "B006", "B007", "B008", "B028", "B904", "B905",
+    "C408", "C416", "C417",
+    "T201",
+    "TC002", "TC003",
+    "SIM102", "SIM108", "SIM118", "SIM211",
+    "COM812",
+]
+extend-select = ["RUF022"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["nested_gdn"]  # ← your package name
+force-sort-within-sections = false
+
+[tool.isort]
+profile = "black"
+line_length = 127
+known_first_party = ["nested_gdn"]  # ← your package name
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"tests/conftest.py" = ["E402", "I001"]
+"tests/*/*.py" = ["UP030"]
+"scripts/*.py" = ["C414"]

@@ -14,3 +14,7 @@ wheels/
 
 # Scripts
 scripts/test.sh
+# Run artifacts
+outputs/
+wandb/
+*.log

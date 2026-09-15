@@ -435,3 +435,98 @@ def test_naive_chunk_nested_gdn2_gradients_flow():
     assert v.grad.abs().sum() > 0, "v got zero gradient"
     assert mix_weights.grad is not None
     assert mix_weights.grad.abs().sum() > 0, "mix_weights got zero gradient"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(("chunk_size", "g_scale"), [(8, 16.0), (16, 8.0), (32, 4.0), (64, 2.0)])
+@pytest.mark.parametrize("L", [1, 2])
+def test_naive_chunk_gradients_finite_under_large_decay(chunk_size, g_scale, L):
+    """Pairwise decay differences must not overflow: exp(+sum|g|) is inf for |g|*BT > 88,
+    and the masked-out inf contributes 0 * inf = NaN to the backward pass."""
+    B, T, H, K, V, N_MAX = 1, 128, 2, 32, 32, 4
+    inputs = _rand_inputs_nested(B, T, H, K, V, L, N_MAX, torch.float32)
+    (q, k, v, g, b, w, mix_weights, query_banks, write_projections, n_queries, firing_t) = inputs
+
+    g = (g.float() * g_scale).detach().requires_grad_(True)
+    v = v.detach().requires_grad_(True)
+
+    o, _ = naive_chunk_nested_gdn2(
+        q,
+        k,
+        v,
+        g,
+        b,
+        w,
+        mix_weights=mix_weights,
+        query_banks=query_banks,
+        write_projections=write_projections,
+        n_queries_per_level=n_queries,
+        firing_intervals=firing_t,
+        L=L,
+        chunk_size=chunk_size,
+    )
+    assert torch.isfinite(o).all(), "forward produced inf/nan"
+
+    o.sum().backward()
+    assert torch.isfinite(g.grad).all(), "g received inf/nan gradient"
+    assert torch.isfinite(v.grad).all(), "v received inf/nan gradient"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("promo_scale", [1.0, 4.0, 16.0, 64.0, 256.0])
+@pytest.mark.parametrize("T", [256, 1024])
+def test_promotion_stable_under_large_write_projections(promo_scale, T):
+    """Level >= 1 write keys are L2-normalized. Without it the gated delta rule stops
+    being a contraction once ||k_write|| > ~2 and the state diverges over many firings."""
+    B, H, K, V, L, N_MAX = 1, 2, 64, 64, 2, 4
+    inputs = _rand_inputs_nested(B, T, H, K, V, L, N_MAX, torch.float32, firing_intervals=(1, 2))
+    (q, k, v, g, b, w, mix_weights, query_banks, write_projections, n_queries, firing_t) = inputs
+
+    query_banks = (query_banks * promo_scale).detach().requires_grad_(True)
+    write_projections = (write_projections * promo_scale).detach().requires_grad_(True)
+
+    o, final_state = naive_chunk_nested_gdn2(
+        q, k, v, g, b, w,
+        mix_weights=mix_weights,
+        query_banks=query_banks,
+        write_projections=write_projections,
+        n_queries_per_level=n_queries,
+        firing_intervals=firing_t,
+        L=L,
+        chunk_size=16,
+        output_final_state=True,
+    )
+    assert torch.isfinite(o).all(), "output diverged"
+    assert torch.isfinite(final_state).all(), "state diverged"
+
+    o.sum().backward()
+    assert torch.isfinite(query_banks.grad).all()
+    assert torch.isfinite(write_projections.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("promo_scale", [1.0, 8.0])
+def test_promotion_normalization_matches_recurrent(promo_scale):
+    """The chunked and recurrent paths must normalize write keys identically."""
+    B, T, H, K, V, L, N_MAX = 1, 256, 2, 32, 32, 2, 4
+    inputs = _rand_inputs_nested(B, T, H, K, V, L, N_MAX, torch.float32, firing_intervals=(1, 2))
+    (q, k, v, g, b, w, mix_weights, query_banks, write_projections, n_queries, firing_t) = inputs
+
+    query_banks = query_banks * promo_scale
+    write_projections = write_projections * promo_scale
+    kwargs = dict(
+        mix_weights=mix_weights,
+        query_banks=query_banks,
+        write_projections=write_projections,
+        n_queries_per_level=n_queries,
+        firing_intervals=firing_t,
+        L=L,
+        chunk_size=64,
+        output_final_state=True,
+    )
+    o_rec, s_rec = naive_recurrent_nested_gdn2(q, k, v, g, b, w, **kwargs)
+    o_chunk, s_chunk = naive_chunk_nested_gdn2(q, k, v, g, b, w, **kwargs)
+
+    torch.testing.assert_close(o_rec, o_chunk, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(s_rec, s_chunk, rtol=1e-4, atol=1e-4)
+

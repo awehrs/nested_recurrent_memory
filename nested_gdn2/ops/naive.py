@@ -19,6 +19,7 @@ def naive_recurrent_nested_gdn2(
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     chunk_size: int = 1,
+    promotion: str = "learned",
 ):
     """Token-by-token reference forward pass for NestedGDN-2.
 
@@ -95,6 +96,12 @@ def naive_recurrent_nested_gdn2(
         b_b = b[:, :, t, lvl]
         b_w = w[:, :, t, lvl]
 
+        if lvl > 0 and promotion == "additive":
+            # Fixed aggregation: the level below is carried up whole, with no
+            # choice about what to promote. Only the decay is learned.
+            h_list[lvl] = h_list[lvl] * b_g.exp().unsqueeze(-1) + h_list[lvl - 1]
+            return
+
         if lvl == 0:
             k_writes = k[:, :, t].unsqueeze(2)
             v_writes = v[:, :, t].unsqueeze(2)
@@ -104,21 +111,17 @@ def naive_recurrent_nested_gdn2(
             Q_lvl = query_banks[lvl - 1, :, :n_lvl].to(S_prev.dtype)
             W_lvl = write_projections[lvl - 1].to(S_prev.dtype)
             v_writes = torch.einsum("bhkv,hnk->bhnv", S_prev, Q_lvl)
-            k_writes = torch.einsum("hkv,bhnv->bhnk", W_lvl, v_writes)
+            k_writes = F.normalize(torch.einsum("hkv,bhnv->bhnk", W_lvl, v_writes), dim=-1)
 
-        S = h_list[lvl]
-        n_writes = k_writes.shape[2]
+        S = h_list[lvl] * b_g.exp().unsqueeze(-1)
 
-        S = S * b_g.exp().unsqueeze(-1)
-
-        for i in range(n_writes):
-            k_i = k_writes[:, :, i]
-            v_i = v_writes[:, :, i]
-            erase = ((b_b * k_i).unsqueeze(-1) * S).sum(-2)
-            v_new = b_w * v_i - erase
-            S = S + k_i.unsqueeze(-1) * v_new.unsqueeze(-2)
-
-        h_list[lvl] = S
+        kb = k_writes * b_b.unsqueeze(-2)
+        gram = torch.einsum("bhnk,bhnj->bhkj", k_writes, kb)
+        h_list[lvl] = (
+            S
+            - torch.einsum("bhkj,bhjv->bhkv", gram, S)
+            + torch.einsum("bhnk,bhnv->bhkv", k_writes, v_writes * b_w.unsqueeze(-2))
+        )
 
     for t in range(T):
         # Level 0 writes before the read: token t's own write is visible at t.
@@ -159,6 +162,7 @@ def naive_chunk_nested_gdn2(
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     chunk_size: int = 64,
+    promotion: str = "learned",
 ):
     """
 
@@ -247,7 +251,7 @@ def naive_chunk_nested_gdn2(
     k_g_b = k_g * b0
 
     decay_ij = (g_cum.unsqueeze(-2) - g_cum.unsqueeze(-3))
-    decay_ij_exp = decay_ij.exp()
+    decay_ij_exp = decay_ij.clamp(max=0).exp()
     tril_mask = torch.tril(
         torch.ones(BT, BT, device=k.device, dtype=torch.bool),
         diagonal=-1,
@@ -257,18 +261,15 @@ def naive_chunk_nested_gdn2(
                            bk, k, decay_ij_exp)
     T_lower = T_lower.masked_fill(~tril_mask, 0.0)
 
-    A_inv = -T_lower
-    for i in range(1, BT):
-        A_inv[..., i, :i] = A_inv[..., i, :i].clone() + (
-            A_inv[..., i, :i, None].clone() * A_inv[..., :i, :i].clone()
-        ).sum(-2)
-    A_inv = A_inv + torch.eye(BT, device=k.device, dtype=torch.float32)
-
-    u_wy = A_inv @ (w0 * v)
-    w_wy = A_inv @ k_g_b
+    # (I + T_lower)^-1 @ rhs, solved directly rather than by forming the inverse.
+    A = torch.eye(BT, device=k.device, dtype=torch.float32) + T_lower
+    wy = torch.linalg.solve_triangular(
+        A, torch.cat([w0 * v, k_g_b], dim=-1), upper=False, unitriangular=True
+    )
+    u_wy, w_wy = wy.split([V, K], dim=-1)
     k_tail = k * (g_last - g_cum).exp()
 
-    decay_qk = (g_cum.unsqueeze(-2) - g_cum.unsqueeze(-3)).exp()
+    decay_qk = (g_cum.unsqueeze(-2) - g_cum.unsqueeze(-3)).clamp(max=0).exp()
     causal_mask = torch.tril(
         torch.ones(BT, BT, device=k.device, dtype=torch.bool),
         diagonal=0,
@@ -317,24 +318,28 @@ def naive_chunk_nested_gdn2(
             b_b = b[:, :, n, -1, lvl]
             b_w = w[:, :, n, -1, lvl]
 
+            if promotion == "additive":
+                S_list[lvl] = S_list[lvl] * b_g.exp().unsqueeze(-1) + S_list[lvl - 1]
+                continue
+
             S_prev = S_list[lvl - 1]
             n_lvl = int(n_queries_per_level[lvl - 1].item())
             Q_lvl = query_banks[lvl - 1, :, :n_lvl].to(S_prev.dtype)
             W_lvl = write_projections[lvl - 1].to(S_prev.dtype)
 
             v_writes = torch.einsum("bhkv,hnk->bhnv", S_prev, Q_lvl)
-            k_writes = torch.einsum("hkv,bhnv->bhnk", W_lvl, v_writes)
+            k_writes = F.normalize(torch.einsum("hkv,bhnv->bhnk", W_lvl, v_writes), dim=-1)
 
-            S = S_list[lvl]
-            S = S * b_g.exp().unsqueeze(-1)
-            n_writes = k_writes.shape[2]
-            for i in range(n_writes):
-                k_i = k_writes[:, :, i]
-                v_i = v_writes[:, :, i]
-                erase = ((b_b * k_i).unsqueeze(-1) * S).sum(-2)
-                v_new_i = b_w * v_i - erase
-                S = S + k_i.unsqueeze(-1) * v_new_i.unsqueeze(-2)
-            S_list[lvl] = S
+            S = S_list[lvl] * b_g.exp().unsqueeze(-1)
+
+            # Batch write -- see naive_recurrent_nested_gdn2.
+            kb = k_writes * b_b.unsqueeze(-2)
+            gram = torch.einsum("bhnk,bhnj->bhkj", k_writes, kb)
+            S_list[lvl] = (
+                S
+                - torch.einsum("bhkj,bhjv->bhkv", gram, S)
+                + torch.einsum("bhnk,bhnv->bhkv", k_writes, v_writes * b_w.unsqueeze(-2))
+            )
 
     o = o.reshape(B, H, T_pad, V)[:, :, :T].transpose(1, 2).contiguous().to(orig_dtype)
 

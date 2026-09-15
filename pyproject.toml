@@ -70,19 +70,17 @@ ignore = [
 extend-select = ["RUF022"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["nested_gdn"]  # ← your package name
+known-first-party = ["nested_gdn2"]
 force-sort-within-sections = false
 
 [tool.isort]
 profile = "black"
 line_length = 127
-known_first_party = ["nested_gdn"]  # ← your package name
+known_first_party = ["nested_gdn2"]
 multi_line_output = 3
 include_trailing_comma = true
 force_grid_wrap = 0
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
-"tests/conftest.py" = ["E402", "I001"]
 "tests/*/*.py" = ["UP030"]
-"scripts/*.py" = ["C414"]

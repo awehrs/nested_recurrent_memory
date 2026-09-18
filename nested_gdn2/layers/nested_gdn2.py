@@ -70,20 +70,20 @@ class NestedGDN2Attention(nn.Module):
         self.dt_bias._no_weight_decay = True
 
         if self.L > 1:
-            self.g_hi = nn.Parameter(torch.zeros(self.L - 1, H))
-            self.b_hi = nn.Parameter(torch.zeros(self.L - 1, H))
-            self.w_hi = nn.Parameter(torch.zeros(self.L - 1, H))
+            # Upper-level gates are projected from the value written: b and w
+            # per pair, g once per firing. Both arms carry them.
+            self.b_projections = nn.Parameter(torch.randn(self.L - 1, H, V, K) * V**-0.5)
+            self.w_projections = nn.Parameter(torch.randn(self.L - 1, H, V, V) * V**-0.5)
+            self.g_projections = nn.Parameter(torch.randn(self.L - 1, H, V, K) * V**-0.5)
             if cfg.promotion == "learned":
                 n_max = max(cfg.n_queries_per_level)
                 self.query_banks = nn.Parameter(torch.randn(self.L - 1, H, n_max, K) * K**-0.5)
-                self.write_projections = nn.Parameter(torch.randn(self.L - 1, H, K, V) * V**-0.5)
+                self.key_projections = nn.Parameter(torch.randn(self.L - 1, H, K, V) * V**-0.5)
             else:
-                # Additive promotion reads neither. Buffers rather than parameters
-                # so the op's signature is satisfied without carrying dead weights
-                # into the arm's parameter count.
+                # Merge reads neither; buffers keep them out of the parameter count.
                 n_max = max(cfg.n_queries_per_level)
                 self.register_buffer("query_banks", torch.zeros(self.L - 1, H, n_max, K), persistent=False)
-                self.register_buffer("write_projections", torch.zeros(self.L - 1, H, K, V), persistent=False)
+                self.register_buffer("key_projections", torch.zeros(self.L - 1, H, K, V), persistent=False)
             self.register_buffer(
                 "n_queries_per_level", torch.tensor(cfg.n_queries_per_level, dtype=torch.int), persistent=False
             )
@@ -113,9 +113,7 @@ class NestedGDN2Attention(nn.Module):
         q = rearrange(q, "b t (l h d) -> b t h l d", l=L, h=H)
         k = rearrange(k, "b t (h d) -> b t h d", d=K)
         v = rearrange(v, "b t (h d) -> b t h d", d=V)
-        # Under autocast, norm runs in fp32 and promotes its input, which would
-        # leave q/k in fp32 while v stays bf16 -- fla's kernels require matching
-        # dtypes across the q/k/v triple. Cast back to what the projections gave.
+        # normalize promotes to fp32 under autocast; fla needs q/k/v to match.
         q = F.normalize(q, dim=-1).to(v.dtype)
         k = F.normalize(k, dim=-1).to(v.dtype)
 
@@ -126,21 +124,18 @@ class NestedGDN2Attention(nn.Module):
         w0 = rearrange(self.w_proj(x).sigmoid(), "b t (h d) -> b t h d", d=V)
 
         if L > 1:
-            shape = (B, T, H, L - 1)
-            g_hi = (-F.softplus(self.g_hi.float())).permute(1, 0).expand(*shape).unsqueeze(-1).expand(*shape, K)
-            b_hi = self.b_hi.sigmoid().permute(1, 0).expand(*shape).unsqueeze(-1).expand(*shape, K)
-            w_hi = self.w_hi.sigmoid().permute(1, 0).expand(*shape).unsqueeze(-1).expand(*shape, V)
-            g = torch.cat([g0.unsqueeze(3), g_hi.to(g0.dtype)], dim=3)
-            b = torch.cat([b0.unsqueeze(3), b_hi.to(b0.dtype)], dim=3)
-            w = torch.cat([w0.unsqueeze(3), w_hi.to(w0.dtype)], dim=3)
-            query_banks, write_projections = self.query_banks, self.write_projections
+            query_banks = self.query_banks
+            key_projections = self.key_projections
+            b_projections, w_projections = self.b_projections, self.w_projections
+            g_projections = self.g_projections
         else:
-            g, b, w = g0.unsqueeze(3), b0.unsqueeze(3), w0.unsqueeze(3)
             query_banks = x.new_empty(0, H, 1, K)
-            write_projections = x.new_empty(0, H, K, V)
+            key_projections = x.new_empty(0, H, K, V)
+            b_projections = x.new_empty(0, H, V, K)
+            w_projections = x.new_empty(0, H, V, V)
+            g_projections = x.new_empty(0, H, V, K)
 
-        # softmax runs in fp32 under autocast; cast back so the op sees one dtype
-        # across q/k/v/b/w/mix and the residual stream stays in the input dtype.
+        # softmax promotes to fp32 under autocast; cast back for one dtype.
         mix = rearrange(self.mix_proj(x), "b t (h l) -> b t h l", h=H).softmax(-1).to(v.dtype)
 
         op = chunk_nested_gdn2 if self.cfg.use_triton else naive_chunk_nested_gdn2
@@ -148,12 +143,15 @@ class NestedGDN2Attention(nn.Module):
             q=q,
             k=k,
             v=v,
-            g=g,
-            b=b,
-            w=w,
+            g=g0,
+            b=b0,
+            w=w0,
             mix_weights=mix,
             query_banks=query_banks,
-            write_projections=write_projections,
+            key_projections=key_projections,
+            b_projections=b_projections,
+            w_projections=w_projections,
+            g_projections=g_projections,
             n_queries_per_level=self.n_queries_per_level,
             firing_intervals=self.firing_intervals,
             L=L,

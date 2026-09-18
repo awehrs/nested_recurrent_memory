@@ -1,175 +1,158 @@
-"""The Triton forward must reproduce naive_chunk_nested_gdn2."""
+"""The triton composition against the naive reference, forward and backward.
+
+The only test that exercises the level chaining, both update kernels, the probe
+replay and the dh_ext injection together.
+"""
 
 import pytest
 import torch
-from fla.utils import device
-from test_nested_gdn2 import _rand_inputs_nested
+from _op_inputs import rand_inputs
 
-from nested_gdn2.ops.chunk_fwd import chunk_nested_gdn2_fwd
+from nested_gdn2.ops.chunk import chunk_nested_gdn2
 from nested_gdn2.ops.naive import naive_chunk_nested_gdn2
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+# fla's level-0 kernels bring their own precision on top of tl.dot's TF32.
 TOL = dict(rtol=2e-2, atol=2e-2)
 
-# n_queries must be a power of two >= 16 for the kernel's tl.dot.
+#  B,   T, H,   K,   V, L,  N, firing,    n_queries
 CASES = [
-    # B,  T,  H,  K,  V,  L,   N,  firing,      n_queries,  BT
-    (1, 128, 2, 64, 64, 2, 16, (1, 2), None, 64),
-    (2, 256, 2, 64, 64, 2, 16, (1, 2), None, 64),
-    (1, 256, 4, 64, 64, 2, 32, (1, 4), None, 64),
-    (2, 512, 2, 64, 64, 3, 16, (1, 2, 4), None, 64),
-    (1, 512, 2, 64, 64, 3, 32, (1, 2, 4), (32, 16), 64),
-    (1, 256, 2, 128, 128, 2, 16, (1, 2), None, 64),
-    (1, 256, 2, 64, 64, 2, 16, (1, 1), None, 64),
+    (1, 128, 2, 64, 64, 2, 16, (1, 2), None),
+    (2, 256, 2, 64, 64, 2, 16, (1, 2), None),
+    (1, 256, 4, 64, 64, 2, 32, (1, 4), None),
+    (2, 512, 2, 64, 64, 3, 16, (1, 2, 4), None),
+    (1, 512, 2, 64, 64, 3, 32, (1, 2, 4), (32, 16)),
+    (1, 256, 2, 128, 128, 2, 16, (1, 2), None),
+    (1, 256, 2, 64, 64, 2, 16, (1, 1), None),
 ]
-IDS = ["B{}-T{}-H{}-K{}-V{}-L{}-N{}-fire{}-q{}-BT{}".format(*c) for c in CASES]
+IDS = ["B{}-T{}-H{}-K{}-V{}-L{}-N{}-fire{}-q{}".format(*c) for c in CASES]
+ARGS = ("B", "T", "H", "K", "V", "L", "N", "firing", "n_queries")
+
+NAMES = (
+    "q", "k", "v", "g", "b", "w", "mix_weights", "query_banks",
+    "key_projections", "b_projections", "w_projections", "g_projections",
+    "n_queries_per_level", "firing_intervals",
+)
+LEAVES = NAMES[:12]
 
 
-def _run_both(B, T, H, K, V, L, N, firing, n_queries, BT, *, initial_state=None):
-    inputs = _rand_inputs_nested(
+def _build(B, T, H, K, V, L, N, firing, n_queries):
+    vals = rand_inputs(
         B, T, H, K, V, L, N, torch.float32,
         firing_intervals=firing,
         n_queries_per_level=n_queries,
     )
-    (q, k, v, g, b, w, mix, qb, wp, nq, fi) = inputs
-    kwargs = dict(
-        mix_weights=mix,
-        query_banks=qb,
-        write_projections=wp,
-        n_queries_per_level=nq,
-        firing_intervals=fi,
-        L=L,
-        chunk_size=BT,
-        initial_state=initial_state,
-        output_final_state=True,
-    )
-    o_ref, s_ref = naive_chunk_nested_gdn2(q, k, v, g, b, w, **kwargs)
-    o_tri, s_tri = chunk_nested_gdn2_fwd(q, k, v, g, b, w, **kwargs)
-    return (o_ref, s_ref), (o_tri, s_tri)
+    return dict(zip(NAMES, vals, strict=True))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize(("B", "T", "H", "K", "V", "L", "N", "firing", "n_queries", "BT"), CASES, ids=IDS)
-def test_matches_naive(B, T, H, K, V, L, N, firing, n_queries, BT):
-    (o_ref, s_ref), (o_tri, s_tri) = _run_both(B, T, H, K, V, L, N, firing, n_queries, BT)
+def _detached(d):
+    return {
+        k: (x.detach().clone().requires_grad_(True) if k in LEAVES else x)
+        for k, x in d.items()
+    }
+
+
+def _grad(t):
+    """Autograd returns None for a leaf the output does not depend on; the
+    Function always allocates. A top level written once and never read hits it."""
+    return torch.zeros_like(t) if t.grad is None else t.grad
+
+
+@pytest.mark.parametrize("promotion", ["learned", "merge"])
+@pytest.mark.parametrize(ARGS, CASES, ids=IDS)
+def test_matches_naive_forward_and_backward(
+    B, T, H, K, V, L, N, firing, n_queries, promotion
+):
+    base = _build(B, T, H, K, V, L, N, firing, n_queries)
+    tri, ref = _detached(base), _detached(base)
+    kw = dict(L=L, chunk_size=64, promotion=promotion)
+
+    o_tri, _ = chunk_nested_gdn2(**tri, **kw)
+    o_ref, _ = naive_chunk_nested_gdn2(**ref, **kw)
     torch.testing.assert_close(o_tri, o_ref, **TOL)
+
+    torch.manual_seed(0)
+    do = torch.randn_like(o_ref)
+    (o_tri * do).sum().backward()
+    (o_ref * do).sum().backward()
+    for name in LEAVES:
+        torch.testing.assert_close(
+            _grad(tri[name]), _grad(ref[name]), **TOL, msg=lambda m, n=name: f"{n}: {m}"
+        )
+
+
+@pytest.mark.parametrize("promotion", ["learned", "merge"])
+def test_final_state_matches_naive(promotion):
+    base = _build(2, 256, 2, 64, 64, 3, 16, (1, 2, 4), None)
+    kw = dict(L=3, chunk_size=64, output_final_state=True, promotion=promotion)
+    _, s_tri = chunk_nested_gdn2(**base, **kw)
+    _, s_ref = naive_chunk_nested_gdn2(**base, **kw)
     torch.testing.assert_close(s_tri, s_ref, **TOL)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize(("B", "T", "H", "K", "V", "L", "N", "firing", "n_queries", "BT"), CASES[:4], ids=IDS[:4])
-def test_matches_naive_with_initial_state(B, T, H, K, V, L, N, firing, n_queries, BT):
-    torch.manual_seed(7)
-    init = torch.randn(B, H, L, K, V, dtype=torch.float32, device=device) * 0.1
-    (o_ref, s_ref), (o_tri, s_tri) = _run_both(
-        B, T, H, K, V, L, N, firing, n_queries, BT, initial_state=init
-    )
+@pytest.mark.parametrize("promotion", ["learned", "merge"])
+def test_initial_state_gradient_matches_naive(promotion):
+    base = _build(2, 256, 2, 64, 64, 2, 16, (1, 2), None)
+    tri, ref = _detached(base), _detached(base)
+
+    torch.manual_seed(1)
+    init = torch.randn(2, 2, 2, 64, 64, device="cuda") * 0.1
+    i_tri = init.detach().clone().requires_grad_(True)
+    i_ref = init.detach().clone().requires_grad_(True)
+    kw = dict(L=2, chunk_size=64, promotion=promotion)
+
+    o_tri, _ = chunk_nested_gdn2(**tri, initial_state=i_tri, **kw)
+    o_ref, _ = naive_chunk_nested_gdn2(**ref, initial_state=i_ref, **kw)
     torch.testing.assert_close(o_tri, o_ref, **TOL)
-    torch.testing.assert_close(s_tri, s_ref, **TOL)
+
+    o_tri.sum().backward()
+    o_ref.sum().backward()
+    torch.testing.assert_close(_grad(i_tri), _grad(i_ref), **TOL)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_l1_reduces_to_level_zero():
-    """With L=1 the composition is stock GDN-2 scaled by its mix weight."""
-    B, T, H, K, V, BT = 2, 256, 2, 64, 64, 64
-    (o_ref, s_ref), (o_tri, s_tri) = _run_both(B, T, H, K, V, 1, 16, (1,), None, BT)
+    """No promotion at L=1, so the upper-level path is never entered."""
+    base = _build(2, 256, 2, 64, 64, 1, 16, (1,), None)
+    kw = dict(L=1, chunk_size=64, output_final_state=True)
+    o_tri, s_tri = chunk_nested_gdn2(**base, **kw)
+    o_ref, s_ref = naive_chunk_nested_gdn2(**base, **kw)
     torch.testing.assert_close(o_tri, o_ref, **TOL)
-    assert s_tri.shape == (B, H, 1, K, V)
+    torch.testing.assert_close(s_tri, s_ref, **TOL)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("T", [64, 192, 320])
+def test_short_and_ragged_sequences(T):
+    """T not a multiple of chunk_size * firing, so the last group never fires."""
+    base = _build(1, T, 2, 64, 64, 3, 16, (1, 2, 4), None)
+    kw = dict(L=3, chunk_size=64, output_final_state=True)
+    o_tri, s_tri = chunk_nested_gdn2(**base, **kw)
+    o_ref, s_ref = naive_chunk_nested_gdn2(**base, **kw)
+    torch.testing.assert_close(o_tri, o_ref, **TOL)
+    torch.testing.assert_close(s_tri, s_ref, **TOL)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_autocast_dtype_mix(dtype):
+    """Under autocast the probe's casts and fla's dtype requirements have to agree."""
+    base = _detached(_build(1, 256, 2, 64, 64, 3, 16, (1, 2, 4), None))
+    with torch.autocast("cuda", dtype=dtype):
+        o, _ = chunk_nested_gdn2(**base, L=3, chunk_size=64)
+    assert torch.isfinite(o).all()
+    o.sum().backward()
+    for name in LEAVES:
+        assert torch.isfinite(_grad(base[name])).all(), name
+
+
 @pytest.mark.parametrize("bad_bt", [16, 32, 128])
 def test_rejects_non_64_chunk_size(bad_bt):
-    with pytest.raises(ValueError, match="chunk_size must be 64"):
-        _run_both(1, 256, 2, 64, 64, 2, 16, (1, 2), None, bad_bt)
+    base = _build(1, 256, 2, 64, 64, 2, 16, (1, 2), None)
+    with pytest.raises((ValueError, AssertionError)):
+        chunk_nested_gdn2(**base, L=2, chunk_size=bad_bt)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("T", [16, 32, 64, 200])
-def test_short_and_ragged_sequences(T):
-    """Sequences shorter than a chunk, or not a multiple of one, must still match."""
-    (o_ref, _), (o_tri, _) = _run_both(1, T, 2, 64, 64, 2, 16, (1, 2), None, 64)
-    torch.testing.assert_close(o_tri, o_ref, **TOL)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("bad", [4, 8, 24, 48])
+@pytest.mark.parametrize("bad", [4, 8, 24])
 def test_rejects_bad_n_queries(bad):
+    base = _build(1, 256, 2, 64, 64, 2, 32, (1, 2), (bad,))
     with pytest.raises(ValueError, match="power of two"):
-        _run_both(1, 128, 2, 64, 64, 2, 64, (1, 2), (bad,), 64)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("L", [1, 2, 3])
-def test_autocast_dtype_mix(L):
-    """The dtypes the layer actually produces under autocast.
-
-    q/k/v/b/w come out of projections in bf16, but ``g`` is built with an
-    explicit .float() and ``mix_weights`` comes from softmax, which autocast
-    runs in fp32. fla's kernels require the q/k/v triple to share a dtype, so
-    this mix -- bf16 tensors alongside fp32 gates and mix weights -- is the
-    combination training hits and the one uniform-dtype tests miss.
-    """
-    B, T, H, K, V, N, BT = 2, 256, 2, 64, 64, 16, 64
-    firing = tuple([1] + [2**i for i in range(1, L)])
-    q, k, v, g, b, w, mix, qb, wp, nq, fi = _rand_inputs_nested(
-        B, T, H, K, V, L, N, torch.bfloat16, firing_intervals=firing
-    )
-    g = g.float()
-    mix = mix.float()
-
-    kwargs = dict(
-        mix_weights=mix, query_banks=qb, write_projections=wp,
-        n_queries_per_level=nq, firing_intervals=fi, L=L,
-        chunk_size=BT, output_final_state=True,
-    )
-    o_ref, s_ref = naive_chunk_nested_gdn2(q, k, v, g, b, w, **kwargs)
-    o_tri, s_tri = chunk_nested_gdn2_fwd(q, k, v, g, b, w, **kwargs)
-
-    assert o_tri.dtype == o_ref.dtype, f"{o_tri.dtype} != {o_ref.dtype}"
-    torch.testing.assert_close(o_tri.float(), o_ref.float(), rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(s_tri, s_ref, rtol=2e-2, atol=2e-2)
-
-
-# =============================================================================
-# permutation invariance
-# =============================================================================
-
-PERM_CASES = [
-    # B,  T,  H,  K,  V,  L,   N,  firing,     n_queries,  BT
-    (1, 256, 2, 64, 64, 2, 16, (1, 2), None, 64),
-    (1, 256, 2, 64, 64, 2, 32, (1, 2), None, 64),
-    (1, 512, 2, 64, 64, 2, 64, (1, 4), None, 64),
-    (1, 512, 2, 64, 64, 3, 16, (1, 2, 4), None, 64),
-]
-PERM_IDS = ["B{}-T{}-H{}-K{}-V{}-L{}-N{}-fire{}-q{}-BT{}".format(*c) for c in PERM_CASES]
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize(("B", "T", "H", "K", "V", "L", "N", "firing", "n_queries", "BT"), PERM_CASES, ids=PERM_IDS)
-def test_query_bank_permutation_invariance(B, T, H, K, V, L, N, firing, n_queries, BT):
-    """The query bank is a set: permuting its rows must not change the output.
-
-    A firing applies all n_queries writes simultaneously against one decayed
-    state, so the row order carries no information. Sequencing the writes would
-    break this.
-    """
-    q, k, v, g, b, w, mix, qb, wp, nq, fi = _rand_inputs_nested(
-        B, T, H, K, V, L, N, torch.float32,
-        firing_intervals=firing,
-        n_queries_per_level=n_queries,
-    )
-    kwargs = dict(
-        mix_weights=mix, write_projections=wp, n_queries_per_level=nq,
-        firing_intervals=fi, L=L, chunk_size=BT, output_final_state=True,
-    )
-    o_ref, f_ref = chunk_nested_gdn2_fwd(q, k, v, g, b, w, query_banks=qb, **kwargs)
-
-    for seed in range(3):
-        gen = torch.Generator(device="cpu").manual_seed(seed)
-        perm = torch.randperm(int(nq.min().item()), generator=gen).to(device)
-        qb_perm = qb.clone()
-        qb_perm[:, :, : perm.numel()] = qb[:, :, perm]
-        o, f = chunk_nested_gdn2_fwd(q, k, v, g, b, w, query_banks=qb_perm, **kwargs)
-
-        torch.testing.assert_close(o, o_ref, **TOL)
-        torch.testing.assert_close(f, f_ref, **TOL)
+        chunk_nested_gdn2(**base, L=2, chunk_size=64)

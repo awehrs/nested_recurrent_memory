@@ -10,10 +10,9 @@ from nested_gdn2.models.modeling_nested_gdn2 import NestedGDN2ForCausalLM
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
-# A level's decay and erase gates only multiply the state already present, so
-# they see no gradient until two of its firings have had their results read:
-# one to populate the state, one to have something to decay. That needs
-# NT >= 2 * f + 1 chunks. Sequence lengths below are sized accordingly.
+# A level's gates only multiply state already present, so they get no gradient
+# until two of its firings have been read: NT >= 2*f + 1 chunks. Sizes below
+# follow that.
 CASES = [
     # num_levels, firing_intervals, n_queries_per_level, T
     (1, (1,), (), 256),
@@ -44,8 +43,7 @@ def test_forward_backward(num_levels, firing, n_queries, T):
 
     out = model(input_ids=ids, labels=ids)
 
-    # Untrained loss must sit at ln(vocab); a wildly different value means the
-    # embedding init or the tying is wrong, not that training is hard.
+    # Untrained loss sits at ln(vocab); off means init or tying is wrong.
     assert abs(out.loss.item() - math.log(512)) < 0.5, out.loss.item()
     assert out.logits.shape == (2, T, 512)
     assert torch.isfinite(out.loss)
@@ -72,10 +70,10 @@ def test_promotion_params_receive_gradient(num_levels, firing, n_queries, T):
         f"gradient below {_min_tokens(firing)} tokens"
     )
 
-    # Per level, not a global max: a single trained level would otherwise mask a
-    # higher one that never fired twice.
+    # Per level: a global max would let one trained level mask a dead one.
     for i, layer in enumerate(model.model.layers):
-        for name in ("query_banks", "write_projections", "g_hi", "b_hi", "w_hi"):
+        for name in ("query_banks", "key_projections", "g_projections",
+                     "b_projections", "w_projections"):
             g = getattr(layer.attn, name).grad
             assert g is not None, f"layer {i} {name} got no gradient"
             for lvl in range(num_levels - 1):
@@ -139,13 +137,11 @@ def test_upper_gates_need_two_read_firings(T, trained):
 
     At firing_intervals=(1, 2) and chunk_size 64, level 1 fires at chunks 1 and
     3. With T=256 (NT=4) the first firing sees an empty state and the second
-    lands on the last chunk, whose result only reaches the loss through the
-    discarded final state -- so g_hi and b_hi get exactly zero. w_hi and the
-    promotion projections are unaffected: they act on the new content, which is
-    nonzero regardless.
+    lands on the last chunk, whose result reaches the loss only through the
+    discarded final state. The write gate is unaffected: it acts on new content.
 
-    The practical consequence is a lower bound on context length: training at
-    T < (2 * f + 1) * chunk_size leaves a level's gates untrained.
+    Consequence: training at T < (2*f + 1) * chunk_size leaves a level's gates
+    untrained.
     """
     torch.manual_seed(0)
     model = NestedGDN2ForCausalLM(_config(2, (1, 2), (16,))).cuda()
@@ -153,7 +149,7 @@ def test_upper_gates_need_two_read_firings(T, trained):
     model(input_ids=ids, labels=ids).loss.backward()
 
     attn = model.model.layers[0].attn
-    for name in ("g_hi", "b_hi"):
+    for name in ("g_projections", "b_projections"):
         got = getattr(attn, name).grad.abs().max().item()
         if trained:
             assert got > 0, f"{name} should receive gradient at T={T}"
@@ -161,11 +157,11 @@ def test_upper_gates_need_two_read_firings(T, trained):
             assert got == 0, f"{name} should be dead at T={T}, got {got}"
 
     # Never dead, at either length.
-    for name in ("w_hi", "query_banks", "write_projections"):
+    for name in ("w_projections", "query_banks", "key_projections"):
         assert getattr(attn, name).grad.abs().max() > 0, name
 
 
-@pytest.mark.parametrize("promotion", ["learned", "additive"])
+@pytest.mark.parametrize("promotion", ["learned", "merge"])
 def test_promotion_arm_wiring(promotion):
     torch.manual_seed(0)
     model = NestedGDN2ForCausalLM(_config(3, (1, 2, 4), (16, 16), promotion=promotion)).cuda()
@@ -173,21 +169,26 @@ def test_promotion_arm_wiring(promotion):
     model(input_ids=ids, labels=ids).loss.backward()
 
     attn = model.model.layers[0].attn
-    assert attn.g_hi.grad.abs().max() > 0
+    assert attn.g_projections.grad.abs().max() > 0
+
+    # Both arms gate identically, so only the two tensors that choose what to
+    # promote differ: parameters for learned, buffers for merge.
+    for name in ("b_projections", "w_projections"):
+        assert getattr(attn, name).grad.abs().max() > 0, name
 
     if promotion == "learned":
-        assert isinstance(attn.query_banks, torch.nn.Parameter)
-        for name in ("b_hi", "w_hi", "query_banks", "write_projections"):
+        for name in ("query_banks", "key_projections"):
+            assert isinstance(getattr(attn, name), torch.nn.Parameter), name
             assert getattr(attn, name).grad.abs().max() > 0, name
     else:
-        assert not isinstance(attn.query_banks, torch.nn.Parameter)
-        for name in ("b_hi", "w_hi"):
-            assert getattr(attn, name).grad.abs().max() == 0, name
+        for name in ("query_banks", "key_projections"):
+            assert not isinstance(getattr(attn, name), torch.nn.Parameter), name
+            assert getattr(attn, name).grad is None, name
 
 
 def test_arms_differ():
     outs = []
-    for promotion in ("learned", "additive"):
+    for promotion in ("learned", "merge"):
         torch.manual_seed(0)
         model = NestedGDN2ForCausalLM(_config(3, (1, 2, 4), (16, 16), promotion=promotion)).cuda()
         ids = torch.randint(0, 512, (2, 640), device="cuda", generator=torch.Generator("cuda").manual_seed(1))

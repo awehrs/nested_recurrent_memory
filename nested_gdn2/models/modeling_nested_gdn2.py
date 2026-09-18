@@ -66,8 +66,7 @@ class NestedGDN2PreTrainedModel(PreTrainedModel):
     _no_split_modules = ["NestedGDN2Block"]
 
     def _init_weights(self, module: nn.Module):
-        # The attention layer initializes A_log, dt_bias and the promotion
-        # parameters itself; only overwrite what it did not set deliberately.
+        # The attention layer sets A_log, dt_bias and the promotion parameters.
         if isinstance(module, NestedGDN2Attention):
             for p in (module.A_log, module.dt_bias):
                 p._no_weight_decay = True

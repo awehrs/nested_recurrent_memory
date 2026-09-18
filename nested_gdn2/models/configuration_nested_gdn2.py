@@ -46,7 +46,7 @@ class NestedGDN2Config(PretrainedConfig):
                 ``firing_intervals[l] * op_chunk_size``.
             n_queries_per_level: probes per level >= 1, length L-1. Each must be
                 a power of two >= 16 on the triton path. Validated on both arms
-                even though additive promotion ignores it, so that two configs
+                even though merge promotion ignores it, so that two configs
                 differing only in ``promotion`` are always both valid.
                 Cost is close to flat up to ``head_dim`` and rises sharply past
                 it: measured on an H100 at head_dim 64, going 16 -> 64 costs
@@ -55,7 +55,7 @@ class NestedGDN2Config(PretrainedConfig):
                 dimension, which is the cheaper order only while it is below
                 head_dim. Default 64 accordingly.
             promotion: how a level is filled from the one below. ``"learned"``
-                probes it with the query bank and writes the result; ``"additive"``
+                probes it with the query bank and writes the result; ``"merge"``
                 carries it up whole. The two arms of the experiment: same state,
                 same schedule, differing only in whether promotion is chosen.
             op_chunk_size: tokens per chunk. Must be 64 for the triton path.
@@ -98,8 +98,8 @@ class NestedGDN2Config(PretrainedConfig):
             raise ValueError(
                 f"firing_intervals must be non-decreasing, got {self.firing_intervals}"
             )
-        if promotion not in ("learned", "additive"):
-            raise ValueError(f"promotion must be 'learned' or 'additive', got {promotion!r}")
+        if promotion not in ("learned", "merge"):
+            raise ValueError(f"promotion must be 'learned' or 'merge', got {promotion!r}")
         if len(self.n_queries_per_level) != num_levels - 1:
             raise ValueError(
                 f"n_queries_per_level must have length num_levels-1={num_levels - 1}, "

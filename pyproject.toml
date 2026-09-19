@@ -26,6 +26,7 @@ dependencies = [
     "einops",
     "pytest>=9.1.1",
     "ruff>=0.16.4",
+    "matplotlib>=3.10.9",
 ]
 
 [project.optional-dependencies]

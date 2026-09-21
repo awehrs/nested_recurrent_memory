@@ -99,13 +99,6 @@ def test_gradient_checkpointing_matches():
         torch.testing.assert_close(a, b, rtol=1e-3, atol=1e-3)
 
 
-def test_use_cache_rejected():
-    model = NestedGDN2ForCausalLM(_config(2, (1, 2), (16,))).cuda()
-    ids = torch.randint(0, 512, (1, 128), device="cuda")
-    with pytest.raises(NotImplementedError, match="use_cache"):
-        model(input_ids=ids, use_cache=True)
-
-
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_autocast(dtype):
     torch.manual_seed(0)
@@ -194,3 +187,87 @@ def test_arms_differ():
         ids = torch.randint(0, 512, (2, 640), device="cuda", generator=torch.Generator("cuda").manual_seed(1))
         outs.append(model(input_ids=ids).logits)
     assert (outs[0] - outs[1]).abs().max() > 1e-3
+
+
+# =============================================================================
+# decoding
+# =============================================================================
+
+
+@pytest.mark.parametrize("promotion", ["learned", "merge"])
+@pytest.mark.parametrize("prompt", [128, 100], ids=["whole-chunks", "ragged"])
+def test_prefill_then_decode_matches_full_forward(prompt, promotion):
+    """Prefill, then one token at a time, against a single forward. The ragged
+    prompt exercises the stepped tail."""
+    torch.manual_seed(0)
+    model = NestedGDN2ForCausalLM(_config(3, (1, 2, 4), (16, 16), promotion=promotion)).cuda().eval()
+    ids = torch.randint(0, 512, (1, prompt + 6), device="cuda")
+
+    with torch.no_grad():
+        full = model(input_ids=ids, use_cache=False).logits
+        out = model(input_ids=ids[:, :prompt], use_cache=True)
+        got = [out.logits[:, -1:]]
+        cache = out.past_key_values
+        for t in range(prompt, ids.shape[1] - 1):
+            out = model(input_ids=ids[:, t : t + 1], past_key_values=cache, use_cache=True)
+            got.append(out.logits)
+            cache = out.past_key_values
+
+    torch.testing.assert_close(
+        torch.cat(got, dim=1), full[:, prompt - 1 : -1], rtol=2e-2, atol=2e-2
+    )
+
+
+@pytest.mark.parametrize("promotion", ["learned", "merge"])
+def test_generate_matches_brute_force(promotion):
+    """generate's per-step scores against a full forward over the same prefix.
+
+    Scores, not token ids: the two paths differ numerically, and an untrained
+    model's top candidates are closer together than that difference, so argmax
+    would flip for reasons that are not bugs.
+    """
+    torch.manual_seed(0)
+    model = NestedGDN2ForCausalLM(_config(2, (1, 2), (16,), promotion=promotion)).cuda().eval()
+    prompt = torch.randint(0, 512, (1, 96), device="cuda")
+    P = prompt.shape[1]
+
+    with torch.no_grad():
+        out = model.generate(
+            prompt, max_new_tokens=8, do_sample=False, use_cache=True,
+            output_scores=True, return_dict_in_generate=True,
+        )
+        ids = prompt
+        for step, scores in enumerate(out.scores):
+            logits = model(input_ids=ids, use_cache=False).logits[:, -1]
+            torch.testing.assert_close(scores, logits, rtol=2e-2, atol=2e-2)
+            ids = torch.cat([ids, out.sequences[:, P + step : P + step + 1]], dim=1)
+
+
+def test_decode_rows_at_different_positions():
+    """Rows continued from prompts of different lengths fire on different
+    tokens: the per-sequence position in the cache."""
+    torch.manual_seed(0)
+    model = NestedGDN2ForCausalLM(_config(3, (1, 2, 4), (16, 16))).cuda().eval()
+    prompts, steps = (128, 96), 5
+    ids = torch.randint(0, 512, (2, max(prompts) + steps), device="cuda")
+
+    with torch.no_grad():
+        caches, got = [], []
+        for row, p in enumerate(prompts):
+            out = model(input_ids=ids[row : row + 1, :p], use_cache=True)
+            caches.append(out.past_key_values)
+            got.append([out.logits[:, -1:]])
+        for i in range(steps):
+            for row, p in enumerate(prompts):
+                out = model(
+                    input_ids=ids[row : row + 1, p + i : p + i + 1],
+                    past_key_values=caches[row], use_cache=True,
+                )
+                caches[row] = out.past_key_values
+                got[row].append(out.logits)
+
+        for row, p in enumerate(prompts):
+            full = model(input_ids=ids[row : row + 1, : p + steps], use_cache=False).logits
+            torch.testing.assert_close(
+                torch.cat(got[row], dim=1), full[:, p - 1 :], rtol=2e-2, atol=2e-2
+            )

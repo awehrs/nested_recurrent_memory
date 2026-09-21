@@ -27,6 +27,7 @@ class NestedGDN2Config(PretrainedConfig):
         fuse_swiglu: bool = True,
         fuse_norm: bool = True,
         fuse_cross_entropy: bool = True,
+        use_cache: bool = True,
         norm_eps: float = 1e-5,
         initializer_range: float = 0.02,
         tie_word_embeddings: bool = False,
@@ -78,6 +79,7 @@ class NestedGDN2Config(PretrainedConfig):
         self.fuse_swiglu = fuse_swiglu
         self.fuse_norm = fuse_norm
         self.fuse_cross_entropy = fuse_cross_entropy
+        self.use_cache = use_cache
         self.norm_eps = norm_eps
         self.initializer_range = initializer_range
         self.num_levels = num_levels

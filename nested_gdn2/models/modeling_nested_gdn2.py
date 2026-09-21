@@ -4,18 +4,21 @@ Block structure follows fla's GatedDeltaNetBlock: pre-norm token mixing with a
 residual, then pre-norm channel mixing with a residual. Only the token mixer
 differs.
 
-Training only -- there is no incremental-decoding path yet, so ``use_cache`` is
-rejected rather than silently ignored. ``naive_recurrent_nested_gdn2`` is the
-token-step reference if generation is needed before the kernel exists.
+Decoding carries fla's ``Cache``: per layer the recurrent state paired with a
+per-sequence position, and the short-convolution history.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from fla.models.utils import Cache, FLAUnsupportedCacheGenerationMixin
 from fla.modules import FusedLinearCrossEntropyLoss, RMSNorm
 from fla.modules import GatedMLP as NestedGDN2MLP
-from transformers.modeling_outputs import BaseModelOutput, CausalLMOutput
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
@@ -53,10 +56,15 @@ class NestedGDN2Block(GradientCheckpointingLayer):
             fuse_swiglu=config.fuse_swiglu,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(self.attn_norm(hidden_states))[0]
+    def forward(self, hidden_states: torch.Tensor, past_key_values=None, use_cache=False):
+        attn_out, _, past_key_values = self.attn(
+            self.attn_norm(hidden_states),
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
+        hidden_states = hidden_states + attn_out
         hidden_states = hidden_states + self.mlp(self.mlp_norm(hidden_states))
-        return hidden_states
+        return hidden_states, past_key_values
 
 
 class NestedGDN2PreTrainedModel(PreTrainedModel):
@@ -107,13 +115,14 @@ class NestedGDN2Model(NestedGDN2PreTrainedModel):
         inputs_embeds: torch.Tensor | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
+        past_key_values=None,
         use_cache: bool | None = None,
         **kwargs,
-    ) -> BaseModelOutput:
-        if use_cache:
-            raise NotImplementedError(
-                "NestedGDN2 has no incremental-decoding path yet; use_cache must be False."
-            )
+    ) -> BaseModelOutputWithPast:
+        use_cache = (
+            use_cache if use_cache is not None
+            else (self.config.use_cache if not self.training else False)
+        )
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Pass exactly one of input_ids or inputs_embeds.")
         output_hidden_states = (
@@ -125,23 +134,33 @@ class NestedGDN2Model(NestedGDN2PreTrainedModel):
 
         hidden_states = self.embeddings(input_ids) if inputs_embeds is None else inputs_embeds
 
+        if use_cache and not isinstance(past_key_values, Cache):
+            past_key_values = Cache.from_legacy_cache(past_key_values)
+
         all_hidden_states = () if output_hidden_states else None
         for layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-            hidden_states = layer(hidden_states)
+            hidden_states, past_key_values = layer(
+                hidden_states, past_key_values=past_key_values, use_cache=use_cache
+            )
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
         if not return_dict:
-            return tuple(x for x in (hidden_states, all_hidden_states) if x is not None)
-        return BaseModelOutput(
-            last_hidden_state=hidden_states, hidden_states=all_hidden_states
+            return tuple(
+                x for x in (hidden_states, past_key_values, all_hidden_states)
+                if x is not None
+            )
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+            hidden_states=all_hidden_states,
         )
 
 
-class NestedGDN2ForCausalLM(NestedGDN2PreTrainedModel):
+class NestedGDN2ForCausalLM(NestedGDN2PreTrainedModel, FLAUnsupportedCacheGenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embeddings.weight"}
 
     def __init__(self, config: NestedGDN2Config):
@@ -164,6 +183,23 @@ class NestedGDN2ForCausalLM(NestedGDN2PreTrainedModel):
     def set_output_embeddings(self, value):
         self.lm_head = value
 
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, use_cache=True, **kwargs
+    ):
+        """Whole prompt on the first call, only new tokens after.
+
+        fla's version slices to the last token whenever a cache object exists,
+        and transformers creates an empty one before the prefill.
+        """
+        seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+        if seen:
+            input_ids = input_ids[:, seen:]
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "use_cache": use_cache,
+        }
+
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -171,22 +207,19 @@ class NestedGDN2ForCausalLM(NestedGDN2PreTrainedModel):
         labels: torch.LongTensor | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
+        past_key_values=None,
         use_cache: bool | None = None,
         **kwargs,
-    ) -> CausalLMOutput:
-        """Standard causal LM forward.
-
-        With ``fuse_cross_entropy`` the logits are never materialized, which at
-        long context is the difference between a [B, T, vocab] tensor fitting
-        and not. Evaluations that need per-token losses -- distance-resolved
-        loss, for one -- must read ``logits``, so they have to run without it.
-        """
+    ) -> CausalLMOutputWithPast:
+        """``fuse_cross_entropy`` skips materializing logits; anything reading
+        ``logits`` has to run without it."""
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         outputs = self.model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             output_hidden_states=output_hidden_states,
             return_dict=True,
+            past_key_values=past_key_values,
             use_cache=use_cache,
         )
         hidden_states = outputs.last_hidden_state
@@ -215,6 +248,9 @@ class NestedGDN2ForCausalLM(NestedGDN2PreTrainedModel):
 
         if not return_dict:
             return tuple(x for x in (loss, logits, outputs.hidden_states) if x is not None)
-        return CausalLMOutput(
-            loss=loss, logits=logits, hidden_states=outputs.hidden_states
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
         )

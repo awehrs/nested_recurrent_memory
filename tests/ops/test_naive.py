@@ -4,7 +4,11 @@ from _op_inputs import rand_inputs as _rand_inputs_nested
 from fla.modules.l2norm import l2_norm
 from fla.utils import device
 
-from nested_gdn2.ops.naive import naive_chunk_nested_gdn2, naive_recurrent_nested_gdn2
+from nested_gdn2.ops.naive import (
+    naive_chunk_nested_gdn2,
+    naive_recurrent_nested_gdn2,
+    naive_step_nested_gdn2,
+)
 
 # =============================================================================
 # naive recurrent
@@ -632,3 +636,96 @@ def test_promotion_stable_under_large_key_projections(promo_scale, T):
     o.sum().backward()
     assert torch.isfinite(query_banks.grad).all()
     assert torch.isfinite(key_projections.grad).all()
+
+
+# =============================================================================
+# decode
+# =============================================================================
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("promotion", ["learned", "merge"])
+@pytest.mark.parametrize(
+    ("L", "firing", "prefill"),
+    [(2, (1, 2), 32), (3, (1, 2, 4), 48), (3, (1, 2, 4), 0)],
+    ids=["L2-prefill2chunks", "L3-prefill3chunks", "L3-no-prefill"],
+)
+def test_prefill_then_step_matches_one_pass(L, firing, prefill, promotion):
+    """Chunked prefill over whole chunks, then one step per token, must equal a
+    single chunked pass. The stepped span crosses several firing boundaries."""
+    B, T, H, K, V, N_MAX, CS = 1, 128, 2, 32, 32, 16, 16
+    (q, k, v, g, b, w, mix, qb, kp, bp, wp, gp, nq, fi) = _rand_inputs_nested(
+        B, T, H, K, V, L, N_MAX, torch.float32, firing_intervals=firing
+    )
+    shared = dict(
+        query_banks=qb, key_projections=kp, b_projections=bp, w_projections=wp,
+        g_projections=gp, n_queries_per_level=nq, firing_intervals=fi,
+        L=L, chunk_size=CS, promotion=promotion,
+    )
+    o_ref, s_ref = naive_chunk_nested_gdn2(
+        q, k, v, g, b, w, mix_weights=mix, output_final_state=True, **shared
+    )
+
+    outs = []
+    state = torch.zeros(B, H, L, K, V, device=device)
+    if prefill:
+        o_pre, state = naive_chunk_nested_gdn2(
+            *(x[:, :prefill] for x in (q, k, v, g, b, w)),
+            mix_weights=mix[:, :prefill], output_final_state=True, **shared,
+        )
+        outs.append(o_pre)
+    for t in range(prefill, T):
+        o_t, state = naive_step_nested_gdn2(
+            q[:, t], k[:, t], v[:, t], g[:, t], b[:, t], w[:, t], mix[:, t],
+            state, t, **shared,
+        )
+        outs.append(o_t.unsqueeze(1))
+
+    torch.testing.assert_close(torch.cat(outs, 1), o_ref, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(state, s_ref, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("promotion", ["learned", "merge"])
+def test_step_handles_sequences_at_different_positions(promotion):
+    """Each row fires on its own tokens, so each must match a single pass over
+    that row alone."""
+    B, T, H, K, V, L, N_MAX, CS = 2, 96, 2, 32, 32, 3, 16, 16
+    firing, prefills = (1, 2, 4), (32, 48)
+    (q, k, v, g, b, w, mix, qb, kp, bp, wp, gp, nq, fi) = _rand_inputs_nested(
+        B, T, H, K, V, L, N_MAX, torch.float32, firing_intervals=firing
+    )
+    shared = dict(
+        query_banks=qb, key_projections=kp, b_projections=bp, w_projections=wp,
+        g_projections=gp, n_queries_per_level=nq, firing_intervals=fi,
+        L=L, chunk_size=CS, promotion=promotion,
+    )
+
+    # Different prefill lengths, so the rows sit at different positions.
+    state = torch.zeros(B, H, L, K, V, device=device)
+    for row, p in enumerate(prefills):
+        _, s = naive_chunk_nested_gdn2(
+            *(x[row : row + 1, :p] for x in (q, k, v, g, b, w)),
+            mix_weights=mix[row : row + 1, :p], output_final_state=True, **shared,
+        )
+        state[row] = s[0]
+
+    pos = torch.tensor(prefills, device=device)
+    steps = T - max(prefills)
+    outs = []
+    for i in range(steps):
+        tok = [p + i for p in prefills]
+        gather = lambda x, tok=tok: torch.stack([x[r, tok[r]] for r in range(B)])  # noqa: E731
+        o_t, state = naive_step_nested_gdn2(
+            *(gather(x) for x in (q, k, v, g, b, w, mix)), state, pos + i, **shared,
+        )
+        outs.append(o_t)
+    got = torch.stack(outs, dim=1)
+
+    for row, p in enumerate(prefills):
+        o_ref, s_ref = naive_chunk_nested_gdn2(
+            *(x[row : row + 1, : p + steps] for x in (q, k, v, g, b, w)),
+            mix_weights=mix[row : row + 1, : p + steps], output_final_state=True, **shared,
+        )
+        torch.testing.assert_close(got[row], o_ref[0, p:], rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(state[row], s_ref[0], rtol=1e-4, atol=1e-4)

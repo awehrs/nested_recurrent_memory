@@ -9,7 +9,7 @@ import torch
 from _op_inputs import rand_inputs
 
 from nested_gdn2.ops.chunk import chunk_nested_gdn2
-from nested_gdn2.ops.naive import naive_chunk_nested_gdn2
+from nested_gdn2.ops.naive import naive_chunk_nested_gdn2, naive_step_nested_gdn2
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -156,3 +156,42 @@ def test_rejects_bad_n_queries(bad):
     base = _build(1, 256, 2, 64, 64, 2, 32, (1, 2), (bad,))
     with pytest.raises(ValueError, match="power of two"):
         chunk_nested_gdn2(**base, L=2, chunk_size=64)
+
+
+@pytest.mark.parametrize("promotion", ["learned", "merge"])
+@pytest.mark.parametrize(
+    ("L", "firing", "prefill"),
+    [(2, (1, 2), 64), (3, (1, 2, 4), 128)],
+    ids=["L2-prefill1chunk", "L3-prefill2chunks"],
+)
+def test_triton_prefill_then_naive_step_matches_one_pass(L, firing, prefill, promotion):
+    """The kernel's final state hands off to the decode step.
+
+    prefill is a whole number of chunks: the triton path fires on a partial
+    final chunk, so a ragged prefill would fire a level early.
+    """
+    B, T, H, K, V, N = 1, 256, 2, 64, 64, 16
+    base = _build(B, T, H, K, V, L, N, firing, None)
+    kw = dict(L=L, chunk_size=64, promotion=promotion)
+    per_token = ("q", "k", "v", "g", "b", "w", "mix_weights")
+    promo = (
+        "query_banks", "key_projections", "b_projections",
+        "w_projections", "g_projections", "n_queries_per_level", "firing_intervals",
+    )
+
+    o_ref, s_ref = chunk_nested_gdn2(**base, output_final_state=True, **kw)
+    o_pre, state = chunk_nested_gdn2(
+        **{n: (base[n][:, :prefill] if n in per_token else base[n]) for n in base},
+        output_final_state=True, **kw,
+    )
+
+    outs = [o_pre]
+    for t in range(prefill, T):
+        o_t, state = naive_step_nested_gdn2(
+            *(base[n][:, t] for n in per_token), state, t,
+            *(base[n] for n in promo), **kw,
+        )
+        outs.append(o_t.unsqueeze(1))
+
+    torch.testing.assert_close(torch.cat(outs, 1), o_ref, **TOL)
+    torch.testing.assert_close(state, s_ref, **TOL)

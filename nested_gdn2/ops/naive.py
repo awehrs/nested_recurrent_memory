@@ -39,6 +39,101 @@ def naive_update_step(
     )
 
 
+def naive_step_nested_gdn2(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    b: torch.Tensor,
+    w: torch.Tensor,
+    mix_weights: torch.Tensor,
+    state: torch.Tensor,
+    position: int | torch.Tensor,
+    query_banks: torch.Tensor,
+    key_projections: torch.Tensor,
+    b_projections: torch.Tensor,
+    w_projections: torch.Tensor,
+    g_projections: torch.Tensor,
+    n_queries_per_level: torch.Tensor,
+    firing_intervals: torch.Tensor,
+    L: int,
+    scale: float | None = None,
+    chunk_size: int = 64,
+    promotion: str = "learned",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One token: level 0 writes, every level is read and mixed, then each level
+    whose firing this token completes promotes, bottom-up.
+
+    Level 0 writes before the read, levels above after, so a firing is first
+    visible at the next token.
+
+    Args:
+        q: [B, H, L, K].
+        k: [B, H, K].
+        v: [B, H, V].
+        g: level-0 log-decay, [B, H, K].
+        b: level-0 erase gate, [B, H, K].
+        w: level-0 write gate, [B, H, V].
+        mix_weights: [B, H, L].
+        state: [B, H, L, K, V], float32.
+        position: index of this token, from 0. An int, or [B] when sequences in
+            the batch sit at different positions and so fire on different tokens.
+        The rest are as for naive_chunk_nested_gdn2.
+
+    Returns:
+        o: [B, H, V], in q's dtype.
+        state: [B, H, L, K, V], float32.
+    """
+    if scale is None:
+        scale = q.shape[-1] ** -0.5
+    out_dtype = q.dtype
+    q, k, v, g, b, w, mix_weights = (
+        x.float() for x in (q, k, v, g, b, w, mix_weights)
+    )
+    S = list(state.float().unbind(2))
+
+    S[0] = naive_update_step(
+        S[0], k.unsqueeze(2), v.unsqueeze(2), b.unsqueeze(2), w.unsqueeze(2), g
+    )
+    reads = torch.einsum("bhlk,bhlkv->bhlv", q * scale, torch.stack(S, dim=2))
+    o = (reads * mix_weights.unsqueeze(-1)).sum(2)
+
+    end = 1 + (
+        position
+        if torch.is_tensor(position)
+        else torch.full(k.shape[:1], position, device=k.device, dtype=torch.long)
+    )
+    at_boundary = end % chunk_size == 0
+    chunk = torch.div(end, chunk_size, rounding_mode="floor")
+
+    # Only the rows that fire are promoted; with rows at different positions,
+    # some row is at a boundary on most steps.
+    for lvl in range(1, L):
+        idx = (at_boundary & (chunk % int(firing_intervals[lvl]) == 0)).nonzero(
+            as_tuple=True
+        )[0]
+        if idx.numel() == 0:
+            continue
+        keys, values, b_pair, w_pair, g_pair = (
+            x.squeeze(1)
+            for x in PROBES[promotion](
+                S[lvl - 1][idx].unsqueeze(1),
+                query_banks[lvl - 1],
+                key_projections[lvl - 1],
+                b_projections[lvl - 1],
+                w_projections[lvl - 1],
+                g_projections[lvl - 1],
+                int(n_queries_per_level[lvl - 1]),
+                torch.float32,
+            )
+        )
+        S[lvl] = S[lvl].index_copy(
+            0, idx, naive_update_step(S[lvl][idx], keys, values, b_pair, w_pair, g_pair)
+        )
+
+    return o.to(out_dtype), torch.stack(S, dim=2)
+
+
 def naive_recurrent_nested_gdn2(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -106,83 +201,26 @@ def naive_recurrent_nested_gdn2(
         o: outputs of shape [B, T, H, V].
         final_state: [B, H, L, K, V] if output_final_state else None.
     """
-    if scale is None:
-        scale = q.shape[-1] ** -0.5
-
-    orig_dtype = q.dtype
-    # q: [B, H, T, L, K]; k/v/g/b/w/mix_weights: [B, H, T, *]
-    q, k, v, g, b, w, mix_weights = (
-        x.transpose(1, 2).contiguous().float()
-        for x in (q, k, v, g, b, w, mix_weights)
-    )
-    B, H, T, K = k.shape
+    B, T, H, K = k.shape
     V = v.shape[-1]
-    BT = chunk_size
+    state = (
+        initial_state.float().clone()
+        if initial_state is not None
+        else torch.zeros(B, H, L, K, V, device=v.device, dtype=torch.float32)
+    )
 
-    o = torch.zeros(B, H, T, V, device=v.device, dtype=torch.float32)
-
-    if initial_state is not None:
-        h_list = [initial_state[:, :, lvl].to(torch.float32).clone() for lvl in range(L)]
-    else:
-        h_list = [torch.zeros(B, H, K, V, device=v.device, dtype=torch.float32) for _ in range(L)]
-
-    q = q * scale
-
-    def _update_level(lvl, t):
-        if lvl > 0:
-            if (t + 1) % BT != 0:
-                return
-            chunk_idx = (t + 1) // BT
-            f_lvl = int(firing_intervals[lvl].item())
-            if chunk_idx % f_lvl != 0:
-                return
-
-        if lvl == 0:
-            b_g = g[:, :, t]
-            k_writes = k[:, :, t].unsqueeze(2)
-            v_writes = v[:, :, t].unsqueeze(2)
-            b_pair = b[:, :, t].unsqueeze(2)
-            w_pair = w[:, :, t].unsqueeze(2)
-        else:
-            # Probe shared with the triton path; only the write below is independent.
-            keys, vals, b_pair, w_pair, g_pair = PROBES[promotion](
-                h_list[lvl - 1].unsqueeze(1),
-                query_banks[lvl - 1],
-                key_projections[lvl - 1],
-                b_projections[lvl - 1],
-                w_projections[lvl - 1],
-                g_projections[lvl - 1],
-                int(n_queries_per_level[lvl - 1].item()),
-                torch.float32,
-            )
-            k_writes, v_writes = keys.squeeze(1), vals.squeeze(1)
-            b_pair, w_pair = b_pair.squeeze(1), w_pair.squeeze(1)
-            b_g = g_pair.squeeze(1)
-
-        h_list[lvl] = naive_update_step(
-            h_list[lvl], k_writes, v_writes, b_pair, w_pair, b_g
-        )
-
+    o = []
     for t in range(T):
-        # Level 0 writes before the read: token t's own write is visible at t.
-        _update_level(0, t)
+        o_t, state = naive_step_nested_gdn2(
+            q[:, t], k[:, t], v[:, t], g[:, t], b[:, t], w[:, t], mix_weights[:, t],
+            state, t,
+            query_banks, key_projections, b_projections, w_projections, g_projections,
+            n_queries_per_level, firing_intervals, L,
+            scale=scale, chunk_size=chunk_size, promotion=promotion,
+        )
+        o.append(o_t)
 
-        # Per-level read using each level's read query.
-        q_reads_t = q[:, :, t]
-        h_stacked = torch.stack(h_list, dim=2)
-        reads = torch.einsum("bhlk,bhlkv->bhlv", q_reads_t, h_stacked)
-
-        mix_t = mix_weights[:, :, t]
-        o[:, :, t] = (reads * mix_t.unsqueeze(-1)).sum(-2)
-
-        # Levels >= 1 write after the read: a firing at t is first visible at t + 1.
-        for lvl in range(1, L):
-            _update_level(lvl, t)
-
-    o = o.transpose(1, 2).contiguous().to(orig_dtype)
-
-    final_state = torch.stack(h_list, dim=2) if output_final_state else None
-    return o, final_state
+    return torch.stack(o, dim=1), (state if output_final_state else None)
 
 
 def naive_chunk_nested_gdn2(

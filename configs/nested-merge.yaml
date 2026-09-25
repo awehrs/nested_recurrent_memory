@@ -1,0 +1,9 @@
+# Same hierarchy as nested-learned, but a level carries the one below up whole
+# instead of choosing what to promote. Isolates the query bank.
+extends: base.yaml
+
+model:
+  num_levels: 4
+  firing_intervals: [1, 2, 4, 8]
+  n_queries_per_level: [16, 32, 64]  # unused by merge; kept so the configs differ in one key
+  promotion: merge

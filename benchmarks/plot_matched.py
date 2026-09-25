@@ -1,16 +1,19 @@
-"""Plots for bench_matched.py: reads benchmarks/results/*.csv, writes assets/bench/*.png.
+"""Plots for bench_matched.py: reads benchmarks/results/$GPU/*.csv, writes assets/bench/*.png.
 
     uv run python benchmarks/plot_matched.py
+    GPU=a100 uv run python benchmarks/plot_matched.py
 """
 
 from __future__ import annotations
 
 import csv
+import os
 import pathlib
 
 import matplotlib.pyplot as plt
 
-RESULTS = pathlib.Path(__file__).parent / "results"
+GPU = os.environ.get("GPU", "h100")
+RESULTS = pathlib.Path(__file__).parent / "results" / GPU
 ASSETS = pathlib.Path(__file__).parent.parent / "assets" / "bench"
 FIGSIZE = (7.5, 4.6)
 COLOR = {64: "#2a78d6", 128: "#eb6834"}

@@ -1,0 +1,8 @@
+# Four levels, each filled by probing the one below with a learned query bank.
+extends: base.yaml
+
+model:
+  num_levels: 4
+  firing_intervals: [1, 2, 4, 8]     # chunks; level 3 fires every 512 tokens
+  n_queries_per_level: [16, 32, 64]  # min(8 * 2^l, head_dim)
+  promotion: learned

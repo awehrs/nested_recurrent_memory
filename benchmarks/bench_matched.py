@@ -4,20 +4,21 @@ Nested with H heads and L levels holds L*H*K*V floats; flat needs L*H heads to
 match. Same state, same head_dim. Ratios are nested / flat, so below 1 means
 nested is cheaper.
 
-Three sweeps, one CSV each in benchmarks/results/:
+Three sweeps, one CSV each in benchmarks/results/$GPU/ (default h100):
     depth    L and head_dim, with the query ladder n_q = min(8 * 2^l, head_dim)
     queries  uniform 16 queries against the ladder, at fixed head_dim
     batch    batch size at the two candidate training configs
 
 A run that runs out of memory is written as a blank row.
 
-    PULL_BACK=benchmarks/results bash scripts/run.sh benchmarks/bench_matched.py
+    GPU=a100 PULL_BACK=benchmarks/results bash scripts/run.sh benchmarks/bench_matched.py
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import os
 import pathlib
 import statistics
 
@@ -31,7 +32,7 @@ from nested_gdn2.ops.chunk import chunk_nested_gdn2
 
 B, H, T = 4, 16, 8192
 REPEATS = 3
-RESULTS = pathlib.Path(__file__).parent / "results"
+RESULTS = pathlib.Path(__file__).parent / "results" / os.environ.get("GPU", "h100")
 
 LEAVES = (
     "q", "k", "v", "g", "b", "w", "mix_weights", "query_banks",
@@ -208,7 +209,7 @@ def run(sweep):
             + fmt(r["nested_gb"], 6, ".1f") + fmt(r["flat_gb"], 9, ".1f")
         )
 
-    RESULTS.mkdir(exist_ok=True)
+    RESULTS.mkdir(parents=True, exist_ok=True)
     path = RESULTS / f"{sweep}.csv"
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=COLUMNS)

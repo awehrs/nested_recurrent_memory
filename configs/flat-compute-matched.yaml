@@ -1,0 +1,8 @@
+# Nested's level 0 standing alone: same heads, same head_dim, no hierarchy.
+# Same per-token compute as an arm of the nested model, a quarter of its state.
+extends: base.yaml
+
+model:
+  num_levels: 1
+  firing_intervals: [1]
+  n_queries_per_level: []

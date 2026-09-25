@@ -63,6 +63,7 @@ while [ -z "$POD_ID" ] || [ "$POD_ID" = "null" ]; do
             minVcpuCount: $((4 * GPU_COUNT)),
             minMemoryInGb: $((32 * GPU_COUNT)),
             gpuTypeId: \"${GPU_TYPE}\",
+            allowedCudaVersions: [\"${CUDA_VERSION:-13.0}\"],
             name: \"${PROJECT_NAME}-run\",
             imageName: \"${IMAGE}\",
             ports: \"22/tcp\",
@@ -187,8 +188,8 @@ cd ~/\${PROJECT_NAME}
 retry() { for a in 1 2 3 4 5 6 7 8; do "\$@" && return 0; echo "  [retry \$a] '\$*' failed, sleep 20s..."; sleep 20; done; return 1; }
 
 echo "Syncing dependencies..."
-# Let uv match the torch CUDA wheel to the pod's driver; RunPod hands out mixed
-# driver versions and a cu130 wheel on a 12.8 driver fails at first cuda call.
+# The lockfile pins a cu130 torch, so the pod request asks for a CUDA 13 host;
+# this only affects packages uv installs outside the lock.
 export UV_TORCH_BACKEND="${UV_TORCH_BACKEND:-auto}"
 retry uv sync
 uv pip install ninja

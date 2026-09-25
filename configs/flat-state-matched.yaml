@@ -1,0 +1,10 @@
+# Flat, but holding nested's whole state: 12 * 128 * 128 == 4 * 12 * 64 * 64
+# floats per layer. Same head count as nested, so the arms differ in one axis --
+# hierarchy against width -- and it costs 226M params against nested's 209M.
+extends: base.yaml
+
+model:
+  num_levels: 1
+  firing_intervals: [1]
+  n_queries_per_level: []
+  head_dim: 128

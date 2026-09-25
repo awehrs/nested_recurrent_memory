@@ -30,8 +30,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-train = ["wandb", "pyyaml", "accelerate"]
+train = ["wandb", "pyyaml", "accelerate", "datasets"]
 dev = ["pytest"]
+
+# Lambda images ship a 570 driver (CUDA 12.8). PyPI's default torch is built
+# for CUDA 13 and can't initialise against it, so resolve torch from the cu128
+# index and let it pull a matching nvidia-*-cu12 stack.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
 
 [project.urls]
 Homepage = "https://github.com/yourname/nested-gdn"

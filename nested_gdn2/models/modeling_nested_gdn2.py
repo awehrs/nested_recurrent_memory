@@ -203,6 +203,7 @@ class NestedGDN2ForCausalLM(NestedGDN2PreTrainedModel, FLAUnsupportedCacheGenera
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         labels: torch.LongTensor | None = None,
         output_hidden_states: bool | None = None,
@@ -212,7 +213,18 @@ class NestedGDN2ForCausalLM(NestedGDN2PreTrainedModel, FLAUnsupportedCacheGenera
         **kwargs,
     ) -> CausalLMOutputWithPast:
         """``fuse_cross_entropy`` skips materializing logits; anything reading
-        ``logits`` has to run without it."""
+        ``logits`` has to run without it.
+
+        ``attention_mask`` is declared because ``generate`` validates it against
+        this signature, but the recurrence has nowhere to put it: a padded token
+        would be folded into the state like any other. Refused rather than
+        ignored, so batched generation can't quietly return wrong answers.
+        """
+        if attention_mask is not None and not bool(attention_mask.all()):
+            raise ValueError(
+                "padded batches are not supported; run with batch_size 1 or "
+                "pack sequences to equal length"
+            )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         outputs = self.model(
             input_ids=input_ids,

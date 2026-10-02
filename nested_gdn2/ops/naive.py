@@ -392,7 +392,7 @@ def naive_chunk_nested_gdn2(
         S_list[0] = S_list[0] * g_last_n.unsqueeze(-1).exp() + k_tail_n.transpose(-1, -2) @ v_new
 
         for lvl in range(1, L):
-            f_lvl = int(firing_intervals[lvl].item())
+            f_lvl = int(firing_intervals[lvl])
             if (n + 1) % f_lvl != 0:
                 continue
 
@@ -403,7 +403,7 @@ def naive_chunk_nested_gdn2(
                 b_projections[lvl - 1],
                 w_projections[lvl - 1],
                 g_projections[lvl - 1],
-                int(n_queries_per_level[lvl - 1].item()),
+                int(n_queries_per_level[lvl - 1]),
                 torch.float32,
             )
             k_writes, v_writes = keys.squeeze(1), vals.squeeze(1)

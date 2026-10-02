@@ -31,7 +31,9 @@ def parse_args():
     p.add_argument("--out", type=Path, default=Path("data/fineweb-edu-gpt2"))
     p.add_argument("--gcs", default="", help="gs:// prefix to upload each finished shard to")
     p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
-    p.add_argument("--subset", default="sample-10BT")
+    p.add_argument("--subset", default="sample-10BT", help="config name; empty for datasets with one")
+    p.add_argument("--split", default="train")
+    p.add_argument("--column", default="text")
     p.add_argument("--tokenizer", default="gpt2")
     p.add_argument("--batch", type=int, default=1000, help="documents per tokenizer call")
     return p.parse_args()
@@ -62,7 +64,10 @@ def main():
     if shards:
         print(f"Resuming after {len(shards)} shards, {tokens_done:,} tokens, {docs_done:,} documents")
 
-    stream = load_dataset(args.dataset, name=args.subset, split="train", streaming=True)
+    # Datasets with a single default config reject name="", so pass None.
+    stream = load_dataset(
+        args.dataset, name=args.subset or None, split=args.split, streaming=True
+    )
     if docs_done:
         stream = stream.skip(docs_done)
 
@@ -103,7 +108,7 @@ def main():
         docs_done += len(texts)
 
     for row in stream:
-        batch.append(row["text"])
+        batch.append(row[args.column])
         if len(batch) < args.batch:
             continue
         flush(batch)

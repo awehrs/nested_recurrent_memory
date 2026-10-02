@@ -38,7 +38,7 @@ KEEP_ALIVE="${KEEP_ALIVE:-0}"
 SERVICE_KEY=~/.config/gcloud/servicekey.json
 
 GCS_BASE="${GCS_BASE:-gs://nested-gdn}"
-DATA_GCS="${DATA_GCS:-${GCS_BASE}/data/fineweb-edu-gpt2}"
+DATA_GCS="${DATA_GCS:-${GCS_BASE}/data/pg19-16k}"
 RESUME_FROM_GCS="${RESUME_FROM_GCS:-}"
 
 LAMBDA_API="https://cloud.lambdalabs.com/api/v1"
@@ -209,8 +209,18 @@ if [ "$SSH_READY" = false ]; then
 fi
 
 # ── sync project ───────────────────────────────────────────────────────────────
-ssh $SSH_OPTS -i $SSH_KEY ${SSH_USER}@${SSH_HOST} \
-    "sudo apt-get update -qq && sudo apt-get install -y -qq rsync tmux"
+# A fresh box answers one connection and then drops the next: cloud-init
+# restarts sshd, or it throttles handshakes. The readiness probe above really
+# did run a command, so retry rather than give up and pay for another boot.
+for attempt in $(seq 1 6); do
+    if ssh $SSH_OPTS -i $SSH_KEY ${SSH_USER}@${SSH_HOST} \
+        "sudo apt-get update -qq && sudo apt-get install -y -qq rsync tmux"; then
+        break
+    fi
+    [ "$attempt" = 6 ] && { echo "apt-get never succeeded over SSH" >&2; exit 1; }
+    echo "   apt-get attempt $attempt failed; retrying in 15s"
+    sleep 15
+done
 
 cp "$SERVICE_KEY" ./servicekey.json
 echo "Syncing project..."

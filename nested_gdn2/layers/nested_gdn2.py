@@ -85,14 +85,14 @@ class NestedGDN2Attention(nn.Module):
                 n_max = max(cfg.n_queries_per_level)
                 self.register_buffer("query_banks", torch.zeros(self.L - 1, H, n_max, K), persistent=False)
                 self.register_buffer("key_projections", torch.zeros(self.L - 1, H, K, V), persistent=False)
-            self.register_buffer(
-                "n_queries_per_level", torch.tensor(cfg.n_queries_per_level, dtype=torch.int), persistent=False
-            )
+            self.n_queries_per_level = tuple(cfg.n_queries_per_level)
         else:
-            self.register_buffer("n_queries_per_level", torch.empty(0, dtype=torch.int), persistent=False)
-        self.register_buffer(
-            "firing_intervals", torch.tensor(cfg.firing_intervals, dtype=torch.int), persistent=False
-        )
+            self.n_queries_per_level = ()
+        # Plain tuples, not buffers: every consumer reads them as Python ints,
+        # and a non-persistent buffer is left uninitialised by from_pretrained,
+        # which builds under a meta device and then fills only from the
+        # state dict. As buffers these arrived as garbage at inference.
+        self.firing_intervals = tuple(cfg.firing_intervals)
 
         self.mix_proj = nn.Linear(d, H * self.L, bias=False)
 

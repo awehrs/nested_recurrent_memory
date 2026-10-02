@@ -1,0 +1,17 @@
+# The measured ceiling: same depth and width as the nested arm, but a KV cache
+# instead of a recurrent state. Layer-matched rather than parameter-matched --
+# the nested model's extra parameters operate its memory, while attention gets
+# its memory as activations for free.
+#
+# At 16k this holds ~302M floats of KV cache per sequence against the nested
+# model's 196K of state, which is the comparison the whole experiment is about.
+extends: base.yaml
+
+model:
+  type: transformer
+  num_attention_heads: 12
+  num_key_value_heads: 12
+  intermediate_size: 2048
+  max_position_embeddings: 16384
+  rope_theta: 500000.0       # long-context base, as in log-linear attention
+  attn_implementation: sdpa  # flash_attention_2 needs a dep we don't carry

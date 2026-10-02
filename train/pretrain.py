@@ -67,6 +67,40 @@ def load_config(argv: list[str]) -> tuple[dict, dict]:
     return cfg, cli
 
 
+def build_model(mcfg: dict):
+    """The arm's architecture. `type` is ours, not a config field, so pop it.
+
+    The Transformer arm is the measured ceiling: same depth and width, but a
+    KV cache instead of a recurrent state.
+    """
+    mcfg = dict(mcfg)
+    kind = mcfg.pop("type", "nested_gdn2")
+    if kind == "nested_gdn2":
+        return NestedGDN2ForCausalLM(NestedGDN2Config(**mcfg))
+    if kind != "transformer":
+        raise SystemExit(f"model.type must be nested_gdn2 or transformer, got {kind!r}")
+
+    from transformers import LlamaConfig, LlamaForCausalLM
+    keep = {
+        "vocab_size", "hidden_size", "num_hidden_layers", "num_attention_heads",
+        "num_key_value_heads", "intermediate_size", "max_position_embeddings",
+        "rope_theta", "initializer_range", "tie_word_embeddings",
+    }
+    attn = mcfg.pop("attn_implementation", "sdpa")
+    # base.yaml carries the nested model's keys; the Transformer shares only
+    # depth, width and vocabulary. Dropped keys are printed rather than
+    # ignored silently, so a misplaced setting is visible in the log.
+    dropped = sorted(set(mcfg) - keep - {"norm_eps"})
+    if dropped:
+        print(f"transformer: ignoring nested-only config keys {dropped}")
+    llama = LlamaConfig(
+        rms_norm_eps=mcfg.get("norm_eps", 1e-5),
+        **{k: v for k, v in mcfg.items() if k in keep},
+    )
+    llama._attn_implementation = attn
+    return LlamaForCausalLM(llama)
+
+
 def param_groups(model, weight_decay: float):
     """Decay matrices only. Norms, biases and the gate parameters stay out."""
     decay, no_decay = [], []
@@ -81,10 +115,21 @@ def param_groups(model, weight_decay: float):
 
 
 def lr_at(step: int, total: int, opt: dict) -> float:
+    """Warmup, then constant, then decay over the last ``decay_frac``.
+
+    Constant rather than cosine so that a validation point partway through is a
+    comparison at the same learning rate as every other point. Under cosine the
+    rate falls as tokens accumulate, and a gap that narrows over training can't
+    be told apart from a gap that narrows as the rate drops.
+    """
     warmup = opt["warmup_steps"]
     if step < warmup:
         return opt["lr"] * (step + 1) / warmup
-    t = (step - warmup) / max(total - warmup, 1)
+
+    decay_start = int(total * (1 - opt.get("decay_frac", 0.1)))
+    if step < decay_start:
+        return opt["lr"]
+    t = (step - decay_start) / max(total - decay_start, 1)
     return opt["min_lr"] + 0.5 * (opt["lr"] - opt["min_lr"]) * (1 + math.cos(math.pi * t))
 
 
@@ -129,7 +174,7 @@ def main():
     run_name = cli.get("run_name", Path(cli.get("config", "run")).stem)
     out_dir = Path(cli.get("out_dir", "outputs")) / "checkpoints"
 
-    model = NestedGDN2ForCausalLM(NestedGDN2Config(**mcfg))
+    model = build_model(mcfg)
     if rcfg.get("compile"):
         model = torch.compile(model)
     optimizer = torch.optim.AdamW(

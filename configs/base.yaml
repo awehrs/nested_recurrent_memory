@@ -22,13 +22,17 @@ model:
   use_triton: true
 
 data:
-  dir: data/fineweb-edu-gpt2
+  dir: data/pg19-16k
   seq_len: 16384
 
 optim:
   lr: 3.0e-4
   min_lr: 3.0e-5
   warmup_steps: 400
+  # Constant after warmup, cosine over the last tenth. Keeps the rate fixed
+  # across the token range so a gap measured at 3B and at 27B is the same
+  # quantity; see lr_at in train/pretrain.py.
+  decay_frac: 0.1
   betas: [0.9, 0.95]
   weight_decay: 0.1
   grad_clip: 1.0
@@ -37,13 +41,15 @@ optim:
   micro_batch: 1
 
 run:
-  tokens: 3_200_000_000      # ~6100 steps at 524288 tokens/step
+  # PG-19 yielded 3,066,539,608 tokens in 31 shards; 30 are training and the
+  # short last one is validation. One epoch, no repetition.
+  tokens: 3_000_000_000      # 5722 steps at 524288 tokens/step
   max_steps: null            # set on the CLI to cut a run short
   compile: false
   dtype: bfloat16
   seed: 0
   log_every: 10
-  val_every: 400
+  val_every: 100             # ~50 points: the gap-vs-tokens curve
   val_batches: 20
-  save_every: 400
+  save_every: 1000
   wandb_project: nested-recurrent-memory

@@ -35,6 +35,8 @@ class NestedGDN2Config(PretrainedConfig):
         firing_intervals: tuple[int, ...] = (1, 4),
         n_queries_per_level: tuple[int, ...] = (64,),
         promotion: str = "learned",
+        read_mix: str = "softmax",
+        max_horizon: int | None = None,
         op_chunk_size: int = 64,
         use_triton: bool = True,
         **kwargs,
@@ -59,6 +61,12 @@ class NestedGDN2Config(PretrainedConfig):
                 probes it with the query bank and writes the result; ``"merge"``
                 carries it up whole. The two arms of the experiment: same state,
                 same schedule, differing only in whether promotion is chosen.
+            read_mix: how the per-level reads are weighted. ``"softmax"`` makes
+                the levels compete for a budget of 1, so an upper level's weight
+                is taken from level 0. ``"sigmoid"`` gates each level on its own.
+            max_horizon: cap on how many tokens level 0 may remember, by
+                clamping its per-token decay to ``-1/max_horizon``. None leaves
+                the decay free.
             op_chunk_size: tokens per chunk. Must be 64 for the triton path.
             use_triton: use the chunkwise triton op rather than the naive
                 reference. The reference is for testing; it is far slower.
@@ -86,6 +94,8 @@ class NestedGDN2Config(PretrainedConfig):
         self.firing_intervals = tuple(firing_intervals)
         self.n_queries_per_level = tuple(n_queries_per_level)
         self.promotion = promotion
+        self.read_mix = read_mix
+        self.max_horizon = max_horizon
         self.op_chunk_size = op_chunk_size
         self.use_triton = use_triton
 
@@ -100,6 +110,10 @@ class NestedGDN2Config(PretrainedConfig):
             raise ValueError(
                 f"firing_intervals must be non-decreasing, got {self.firing_intervals}"
             )
+        if max_horizon is not None and max_horizon < 1:
+            raise ValueError(f"max_horizon must be >= 1 or None, got {max_horizon}")
+        if read_mix not in ("softmax", "sigmoid"):
+            raise ValueError(f"read_mix must be 'softmax' or 'sigmoid', got {read_mix!r}")
         if promotion not in ("learned", "merge"):
             raise ValueError(f"promotion must be 'learned' or 'merge', got {promotion!r}")
         if len(self.n_queries_per_level) != num_levels - 1:

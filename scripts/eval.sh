@@ -1,12 +1,16 @@
 #!/bin/bash
 set -e
 
-# Positional perplexity for finished checkpoints, on one GPU. Launches an
-# instance, runs, uploads results to GCS, pulls them back, and terminates.
+# Positional perplexity and loss-based retention for finished checkpoints, on
+# one GPU. Launches an instance, runs, uploads results to GCS, pulls them back,
+# and terminates.
 #
 #   bash scripts/eval.sh
 #   ARMS="nested-learned flat-compute-matched" bash scripts/eval.sh
 #   RUN_FILTER='-2026092[34]-' bash scripts/eval.sh        # pin older runs
+#   RUN_FILTER='20260929-1456|compute-matched-20261007'    # a run per arm
+#   CKPT_STEP=002000 bash scripts/eval.sh                  # step-match the arms
+#   RETENTION_ARMS="" bash scripts/eval.sh                 # perplexity only
 #   KEEP_ALIVE=1 bash scripts/eval.sh                      # no self-termination
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -55,6 +59,26 @@ PPL_SPLIT="${PPL_SPLIT:-test}"
 PPL_PROC="${PPL_PROC:-8}"
 PPL_BLOCK="${PPL_BLOCK:-16384}"
 PPL_BUCKET="${PPL_BUCKET:-1024}"
+
+# No colon: RETENTION_ARMS="" has to disable the stage, and ${VAR:-default}
+# substitutes on empty as well as unset.
+RETENTION_ARMS="${RETENTION_ARMS-$ARMS}"
+RETENTION_ARMS=$(echo $RETENTION_ARMS)
+RET_SPAN="${RET_SPAN:-64}"
+RET_SEQ="${RET_SEQ:-16384}"
+RET_TRIALS="${RET_TRIALS:-32}"
+RET_SEED="${RET_SEED:-0}"
+RET_DIST="${RET_DIST:-256,1024,2048,4096,8192,15360}"
+RET_DTYPE="${RET_DTYPE:-float32}"
+RET_PROBES="${RET_PROBES:-repeat,continuation}"
+RET_LEVELS="${RET_LEVELS:-0}"
+
+# Only ARMS get their checkpoints fetched, so a retention arm outside that set
+# would fail an hour in, after provisioning.
+for arm in $RETENTION_ARMS; do
+    echo " $ARMS " | grep -q " $arm " || {
+        echo "RETENTION_ARMS has '${arm}', which is not in ARMS" >&2; exit 2; }
+done
 
 LAMBDA_API="https://cloud.lambdalabs.com/api/v1"
 api() {
@@ -164,9 +188,16 @@ CKPTS=""
 for arm in $ARMS; do
     # RUN_FILTER pins an older run; without it the newest one for the arm wins,
     # which silently mixes corpora once an arm has been retrained.
-    run=$(gsutil ls "${GCS_BASE}/runs/" 2>/dev/null | grep "/${arm}-" | grep -- "${RUN_FILTER:-}" | tail -1)
+    # -E so one filter can pin a different run per arm, as an alternation.
+    # The arm name has to be followed by the timestamp and nothing else, or
+    # 'nested-learned' also matches 'nested-learned-seed1-...' and silently
+    # evaluates the wrong checkpoint.
+    run=$(gsutil ls "${GCS_BASE}/runs/" 2>/dev/null \
+        | grep -E "/${arm}-[0-9]{8}-[0-9]{4}/$" | grep -E -- "${RUN_FILTER:-}" | tail -1)
     [ -n "$run" ] || { echo "No runs for ${arm} under ${GCS_BASE}/runs/" >&2; exit 2; }
-    hf=$(gsutil ls -d "${run}step_*/hf" 2>/dev/null | tail -1)
+    # CKPT_STEP step-matches arms whose runs differ in length; without it the
+    # newest checkpoint wins, which compares 5722 steps against 2000.
+    hf=$(gsutil ls -d "${run}step_*${CKPT_STEP:-}/hf" 2>/dev/null | tail -1)
     [ -n "$hf" ] || { echo "No hf/ checkpoint under ${run}" >&2; exit 2; }
     CKPTS="${CKPTS}${arm}=${hf%/} "
     echo "${arm} -> ${hf%/}"
@@ -301,6 +332,18 @@ done
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 uv run python -c "import torch,sys; n=torch.cuda.device_count(); print('devices',n); sys.exit(0 if n else 1)" || exit 1
 
+# Retention runs last but is the newest code; smoke it now so a bug shows up in
+# a minute rather than after the perplexity pass.
+SMOKE=\$(echo ${RETENTION_ARMS} | awk '{print \$1}')
+if [ -n "\$SMOKE" ]; then
+    echo "--- retention smoke: \$SMOKE ---"
+    PYTHONPATH=~/${PROJECT_NAME} uv run python evals/retention.py \
+        -p ~/ckpt/\$SMOKE -d ${PPL_DATA} -s ${PPL_SPLIT} --arm smoke \
+        --trials 1 --distances 256 --dtype ${RET_DTYPE} \
+        --probes ${RET_PROBES} --read-levels ${RET_LEVELS} \
+        --output /tmp/smoke.json || exit 1
+fi
+
 for pair in ${CKPTS}; do
     arm=\${pair%%=*}
     echo "--- perplexity: \$arm ---"
@@ -308,6 +351,20 @@ for pair in ${CKPTS}; do
         -p ~/ckpt/\$arm -d ${PPL_DATA} -s ${PPL_SPLIT} --num_proc ${PPL_PROC} \
         --block_size ${PPL_BLOCK} --bucket_size ${PPL_BUCKET} \
         --output ~/results/ppl-\$arm.json || echo "  \$arm FAILED"
+done
+
+# Over the resolved pairs, not RETENTION_ARMS, so each result can record the
+# GCS path it came from; the local ~/ckpt/<arm> says nothing about which run.
+for pair in ${CKPTS}; do
+    arm=\${pair%%=*}; src=\${pair#*=}
+    echo " ${RETENTION_ARMS} " | grep -q " \$arm " || continue
+    echo "--- retention: \$arm ---"
+    PYTHONPATH=~/${PROJECT_NAME} uv run python evals/retention.py \
+        -p ~/ckpt/\$arm -d ${PPL_DATA} -s ${PPL_SPLIT} --arm \$arm \
+        --span ${RET_SPAN} --seq-len ${RET_SEQ} --trials ${RET_TRIALS} \
+        --seed ${RET_SEED} --distances ${RET_DIST} --dtype ${RET_DTYPE} \
+        --probes ${RET_PROBES} --read-levels ${RET_LEVELS} --source "\$src" \
+        --output ~/results/retention-\$arm.json || echo "  \$arm FAILED"
 done
 
 echo "=== done \$(date -u) ==="
@@ -320,6 +377,14 @@ ssh $SSH_OPTS -o ConnectTimeout=30 -i $SSH_KEY -p $SSH_PORT ${SSH_USER}@${SSH_HO
     "chmod +x setup_eval.sh && tmux new-session -d -s eval 'bash setup_eval.sh 2>&1 | tee ~/eval.log'"
 STARTED=1
 
+# Per stamp: the result filenames are keyed by arm only, so a flat directory
+# lets the next run overwrite this one's. Returns non-zero if nothing landed.
+download_results() {
+    mkdir -p "outputs/evals/${STAMP}"
+    gsutil -m -q cp -r "${GCS_DEST}/*" "outputs/evals/${STAMP}/" 2>/dev/null || true
+    [ -n "$(ls -A "outputs/evals/${STAMP}" 2>/dev/null)" ]
+}
+
 echo "Tailing (Ctrl-C stops watching, not the run)..."
 misses=0
 while ! ssh $SSH_OPTS -o ConnectTimeout=20 -i $SSH_KEY -p $SSH_PORT ${SSH_USER}@${SSH_HOST} \
@@ -331,11 +396,22 @@ while ! ssh $SSH_OPTS -o ConnectTimeout=20 -i $SSH_KEY -p $SSH_PORT ${SSH_USER}@
             "tail -n 50 -f ~/eval.log --pid=\$(tmux list-panes -t eval -F '#{pane_pid}' 2>/dev/null | head -1)" || true
     else
         misses=$((misses + 1))
-        [ "$misses" -ge 30 ] && { echo "Instance unreachable; the run continues."; exit 0; }
+        if [ "$misses" -ge 30 ]; then
+            # The box uploads to GCS and only then terminates itself, so losing
+            # contact usually means it finished, not that it died. Results in
+            # the bucket settle which one it was.
+            if download_results; then
+                echo "Instance gone, results in outputs/evals/${STAMP}/"
+                exit 0
+            fi
+            echo "Instance unreachable and ${GCS_DEST}/ is empty: outcome unknown." >&2
+            echo "The run may still be going. To download later:" >&2
+            echo "  gsutil -m cp -r '${GCS_DEST}/*' outputs/evals/${STAMP}/" >&2
+            exit 3
+        fi
     fi
     sleep 5
 done
 
-mkdir -p outputs/evals
-gsutil -m -q cp -r "${GCS_DEST}/*" outputs/evals/ 2>/dev/null || true
-echo "Results: outputs/evals/  and  ${GCS_DEST}/"
+download_results || echo "Nothing in ${GCS_DEST}/ to download." >&2
+echo "Results: outputs/evals/${STAMP}/  and  ${GCS_DEST}/"

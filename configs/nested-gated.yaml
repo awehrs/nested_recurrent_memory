@@ -1,0 +1,17 @@
+# nested-learned with the read softmax replaced by per-level sigmoid gates.
+#
+# Under the softmax the levels compete: weight given to level 1 is taken from
+# level 0. The baseline collapses onto level 0 under that pressure -- half of
+# all head-tokens put over 0.95 of their read on one level by step 5722, up
+# from a quarter at step 2000. Independent gates let a level be read without
+# anything being taken from another, which is the choice HAM makes for the
+# same reason. The readouts are the loss against nested-learned and the read
+# weights, which under gating need not sum to 1.
+extends: base.yaml
+
+model:
+  num_levels: 4
+  firing_intervals: [1, 2, 4, 8]
+  n_queries_per_level: [16, 32, 64]
+  promotion: learned
+  read_mix: sigmoid

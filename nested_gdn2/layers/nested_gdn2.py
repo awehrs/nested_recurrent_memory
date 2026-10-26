@@ -142,6 +142,10 @@ class NestedGDN2Attention(nn.Module):
         g0 = F.softplus(self.f_proj(x).float() + self.dt_bias)
         g0 = rearrange(g0, "b t (h d) -> b t h d", d=K)
         g0 = -self.A_log.float().exp().unsqueeze(-1) * g0
+        # Decay is exp(g0) per token, so 1/|g0| is the horizon. Channels pinned
+        # at the floor get no gradient.
+        if self.cfg.max_horizon:
+            g0 = g0.clamp(max=-1.0 / self.cfg.max_horizon)
         b0 = rearrange(self.b_proj(x).sigmoid(), "b t (h d) -> b t h d", d=K)
         w0 = rearrange(self.w_proj(x).sigmoid(), "b t (h d) -> b t h d", d=V)
 
@@ -157,8 +161,19 @@ class NestedGDN2Attention(nn.Module):
             w_projections = x.new_empty(0, H, V, V)
             g_projections = x.new_empty(0, H, V, K)
 
-        # softmax promotes to fp32 under autocast; cast back for one dtype.
-        mix = rearrange(self.mix_proj(x), "b t (h l) -> b t h l", h=H).softmax(-1).to(v.dtype)
+        # Both promote to fp32 under autocast; cast back for one dtype.
+        mix_logits = rearrange(self.mix_proj(x), "b t (h l) -> b t h l", h=H)
+        gated = self.cfg.read_mix == "sigmoid"
+        mix = (mix_logits.sigmoid() if gated else mix_logits.softmax(-1)).to(v.dtype)
+
+        # Inference-only read ablation, set by the eval scripts and never
+        # declared on the config. Renormalizes under softmax only; the gated
+        # weights never summed to 1.
+        keep = getattr(self.cfg, "read_levels", None)
+        if keep is not None:
+            masked = torch.zeros_like(mix)
+            masked[..., list(keep)] = mix[..., list(keep)]
+            mix = masked if gated else masked / masked.sum(-1, keepdim=True)
 
         promo = dict(
             query_banks=query_banks,

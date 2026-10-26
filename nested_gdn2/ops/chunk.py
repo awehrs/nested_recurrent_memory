@@ -191,7 +191,9 @@ def chunk_nested_gdn2_fwd(
         b: level-0 erase gate, [B, T, H, K]. Levels above get theirs from the
             probe, per pair.
         w: level-0 write gate, [B, T, H, V]. Same.
-        mix_weights: per-token per-level mix, [B, T, H, L], pre-softmaxed.
+        mix_weights: per-token per-level read weights, [B, T, H, L], already
+            activated by the caller. Used as a plain weighted sum, so they need
+            not sum to 1.
         query_banks: probes for levels >= 1, [L-1, H, N, K]. Padded to the
             widest level; each level slices what it uses.
         key_projections: value->key, for levels >= 1, [L-1, H, K, V].

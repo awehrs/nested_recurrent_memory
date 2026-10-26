@@ -11,8 +11,8 @@ source .env
 # only difference is what gets executed remotely.
 #
 # Usage: bash scripts/run.sh <target.py> [target args...]
-#   bash scripts/run.sh benchmarks/bench_chunk.py
-#   bash scripts/run.sh benchmarks/bench_chunk.py --only breakdown
+#   bash scripts/run.sh benchmarks/bench_matched.py
+#   bash scripts/run.sh benchmarks/bench_matched.py --only queries
 #   PULL_BACK="outputs" bash scripts/run.sh train/pretrain.py --steps 100
 
 if [ $# -lt 1 ]; then

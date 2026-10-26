@@ -1,0 +1,16 @@
+# nested-learned with level 0's memory capped at 256 tokens.
+#
+# The baseline puts 0.90 of its read on level 0 and 0.0066 on level 3: promotion
+# is optional, so it is never trained by anything but a weak side channel. With
+# level 0 unable to hold more than 256 tokens, and level 1's horizon near 7k,
+# anything older has nowhere to live but upstairs. Readouts are the learned mix
+# and retention at range, not the loss -- level 0 is handicapped at the job that
+# carries most of the loss, so the loss is expected to be worse.
+extends: base.yaml
+
+model:
+  num_levels: 4
+  firing_intervals: [1, 2, 4, 8]
+  n_queries_per_level: [16, 32, 64]
+  promotion: learned
+  max_horizon: 256

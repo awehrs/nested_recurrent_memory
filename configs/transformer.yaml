@@ -3,8 +3,8 @@
 # the nested model's extra parameters operate its memory, while attention gets
 # its memory as activations for free.
 #
-# At 16k this holds ~302M floats of KV cache per sequence against the nested
-# model's 196K of state, which is the comparison the whole experiment is about.
+# At 16k this holds 302M floats of KV cache per sequence against the nested
+# model's 2.36M of state, 128x -- and 128x per layer too, 25.2M against 196K.
 extends: base.yaml
 
 model:
